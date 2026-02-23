@@ -49,6 +49,7 @@ setup(
     entry_points={
         "console_scripts": [
             "train-sonata-lidiff=training.train_diffusion:main",
+            "train-refinement=training.train_refinement:main",
         ],
     },
 )

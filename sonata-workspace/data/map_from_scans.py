@@ -1,0 +1,286 @@
+"""
+Ground Truth Map Generation for SemanticKITTI
+
+Generates complete scene maps by aggregating sequential LiDAR scans using poses.
+Output format matches what SemanticKITTI dataset expects: ground_truth/{seq}/{scan_id}.npz
+Each npz contains 'points': (N, 3) in the scan's coordinate frame.
+
+Based on LiDiff's map_from_scans.py, rewritten to avoid MinkowskiEngine.
+Supports numpy, open3d (faster CPU), and torch (GPU) backends.
+"""
+
+import os
+import argparse
+import numpy as np
+from tqdm import tqdm
+
+
+def parse_calibration(filename: str) -> dict:
+    """Parse SemanticKITTI calibration file."""
+    calib = {}
+    if not os.path.exists(filename):
+        return calib
+
+    with open(filename) as f:
+        for line in f:
+            line = line.strip()
+            if ":" not in line:
+                continue
+            key, content = line.split(":", 1)
+            values = [float(v) for v in content.strip().split()]
+            pose = np.eye(4)
+            pose[0, :4] = values[0:4]
+            pose[1, :4] = values[4:8]
+            pose[2, :4] = values[8:12]
+            calib[key.strip()] = pose
+    return calib
+
+
+def load_poses(calib_path: str, poses_path: str) -> list:
+    """Load poses and apply calibration if available."""
+    poses = []
+    with open(poses_path) as f:
+        for line in f:
+            values = [float(v) for v in line.strip().split()]
+            pose = np.eye(4)
+            pose[0, :4] = values[0:4]
+            pose[1, :4] = values[4:8]
+            pose[2, :4] = values[8:12]
+
+            if os.path.exists(calib_path):
+                calib = parse_calibration(calib_path)
+                if "Tr" in calib:
+                    Tr = calib["Tr"]
+                    Tr_inv = np.linalg.inv(Tr)
+                    pose = Tr_inv @ pose @ Tr
+
+            poses.append(pose)
+    return poses
+
+
+def voxelize_numpy(points: np.ndarray, voxel_size: float) -> np.ndarray:
+    """Voxelize point cloud using numpy (no MinkowskiEngine)."""
+    voxel_coords = np.floor(points / voxel_size).astype(np.int32)
+    unique_voxels = np.unique(voxel_coords, axis=0)
+    voxel_centers = unique_voxels.astype(np.float32) * voxel_size + voxel_size / 2
+    return voxel_centers
+
+
+def voxelize_open3d(points: np.ndarray, voxel_size: float) -> np.ndarray:
+    """Voxelize using Open3D (faster CPU, already in Sonata)."""
+    import open3d as o3d
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+    down = pcd.voxel_down_sample(voxel_size)
+    return np.asarray(down.points, dtype=np.float32)
+
+
+def voxelize_torch(points: np.ndarray, voxel_size: float, device: str = "cuda") -> np.ndarray:
+    """Voxelize on GPU using PyTorch (fast for large point clouds)."""
+    import torch
+    dev = torch.device(device if torch.cuda.is_available() else "cpu")
+    pts = torch.from_numpy(points.astype(np.float32)).to(dev)
+    coords = (pts / voxel_size).floor().long()
+    unique_coords = torch.unique(coords, dim=0)
+    centers = unique_coords.float() * voxel_size + voxel_size / 2
+    return centers.cpu().numpy().astype(np.float32)
+
+
+def voxelize(points: np.ndarray, voxel_size: float, backend: str = "numpy") -> np.ndarray:
+    """Voxelize point cloud. backend: 'numpy' | 'open3d' | 'torch'."""
+    if backend == "open3d":
+        return voxelize_open3d(points, voxel_size)
+    if backend == "torch":
+        return voxelize_torch(points, voxel_size)
+    return voxelize_numpy(points, voxel_size)
+
+
+def generate_sequence_map(
+    seq_path: str,
+    output_dir: str,
+    voxel_size: float = 0.1,
+    sequences: list = None,
+    backend: str = "numpy",
+) -> None:
+    """
+    Generate ground truth maps for a sequence.
+
+    Args:
+        seq_path: Path to sequences folder (e.g., .../dataset/sequences)
+        output_dir: Output root for ground_truth (e.g., .../dataset)
+        voxel_size: Voxel size for aggregation
+        sequences: List of sequence IDs to process (default: 00-10)
+    """
+    if sequences is None:
+        sequences = ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10"]
+
+    # Moving object labels to filter (SemanticKITTI)
+    MOVING_LABELS = {
+        252, 253, 254, 255, 256, 257, 258, 259
+    }  # moving-car, moving-person, etc.
+
+    for seq in sequences:
+        seq_folder = os.path.join(seq_path, seq)
+        velodyne_dir = os.path.join(seq_folder, "velodyne")
+        labels_dir = os.path.join(seq_folder, "labels")
+        poses_path = os.path.join(seq_folder, "poses.txt")
+        calib_path = os.path.join(seq_folder, "calib.txt")
+
+        if not os.path.exists(velodyne_dir):
+            print(f"Skipping {seq}: velodyne not found")
+            continue
+        if not os.path.exists(poses_path):
+            print(f"Skipping {seq}: poses.txt not found")
+            continue
+
+        scan_files = sorted([f for f in os.listdir(velodyne_dir) if f.endswith(".bin")])
+        if len(scan_files) == 0:
+            print(f"Skipping {seq}: no .bin files")
+            continue
+
+        poses = load_poses(calib_path, poses_path)
+        if len(poses) != len(scan_files):
+            print(f"Warning {seq}: {len(poses)} poses vs {len(scan_files)} scans")
+
+        # Aggregate all scans in world frame
+        all_points = []
+        for i, (pose, scan_file) in enumerate(
+            tqdm(
+                list(zip(poses, scan_files)),
+                desc=f"Sequence {seq}",
+                leave=False,
+            )
+        ):
+            scan_path = os.path.join(velodyne_dir, scan_file)
+            points = np.fromfile(scan_path, dtype=np.float32).reshape(-1, 4)
+
+            # Load labels to remove moving objects
+            label_path = os.path.join(labels_dir, scan_file.replace(".bin", ".label"))
+            if os.path.exists(label_path):
+                labels = np.fromfile(label_path, dtype=np.uint32) & 0xFFFF
+                static_mask = (labels < 252) | (labels > 259)
+                if static_mask.sum() < len(labels):
+                    points = points[static_mask]
+
+            # Remove flying artifacts (close to origin)
+            dist = np.linalg.norm(points[:, :3], axis=1)
+            points = points[dist > 3.5]
+
+            # Transform to world frame
+            ones = np.ones((points.shape[0], 1))
+            points_homo = np.hstack([points[:, :3], ones])  # (N, 4)
+            points_world = (pose @ points_homo.T).T[:, :3]
+            all_points.append(points_world)
+
+        if len(all_points) == 0:
+            print(f"Skipping {seq}: no points")
+            continue
+
+        map_points = np.vstack(all_points)
+
+        # Voxelize (numpy | open3d | torch)
+        map_voxel = voxelize(map_points, voxel_size, backend=backend)
+
+        # Output: one map per sequence, and per-scan copies in scan frame
+        gt_seq_dir = os.path.join(output_dir, "ground_truth", seq)
+        os.makedirs(gt_seq_dir, exist_ok=True)
+
+        # Save world-frame map once (for reference)
+        np.savez(
+            os.path.join(gt_seq_dir, "map_world.npz"),
+            points=map_voxel.astype(np.float32),
+        )
+
+        # For each scan, save map in scan frame (aligns with partial input)
+        for i, (pose, scan_file) in enumerate(zip(poses, scan_files)):
+            if i >= len(poses):
+                break
+            pose_inv = np.linalg.inv(poses[i])
+            ones = np.ones((map_voxel.shape[0], 1))
+            map_homo = np.hstack([map_voxel, ones])
+            map_scan_frame = (pose_inv @ map_homo.T).T[:, :3]
+
+            scan_id = scan_file.replace(".bin", "")
+            np.savez(
+                os.path.join(gt_seq_dir, f"{scan_id}.npz"),
+                points=map_scan_frame.astype(np.float32),
+            )
+
+        print(f"Saved ground truth for sequence {seq} ({len(scan_files)} scans)")
+
+
+def main():
+    _default_root = os.path.expanduser("~/Simon_ws/dataset/SemanticKITTI/dataset")
+    _default_sequences = os.path.join(_default_root, "sequences")
+    parser = argparse.ArgumentParser(
+        description="Generate ground truth maps from SemanticKITTI sequences"
+    )
+    parser.add_argument(
+        "--path",
+        "-p",
+        type=str,
+        default=_default_sequences,
+        help="Path to dataset sequences folder (default: ~/Simon_ws/dataset/SemanticKITTI/dataset/sequences)",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default=_default_root,
+        help="Output root for ground_truth/ (default: ~/Simon_ws/dataset/SemanticKITTI/dataset)",
+    )
+    parser.add_argument(
+        "--voxel_size",
+        "-v",
+        type=float,
+        default=0.1,
+        help="Voxel size for aggregation (default: 0.1)",
+    )
+    parser.add_argument(
+        "--sequences",
+        "-s",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Sequence IDs to process (default: 00 01 02 03 04 05 06 07 08 09 10)",
+    )
+    parser.add_argument(
+        "--backend",
+        "-b",
+        type=str,
+        choices=["numpy", "open3d", "torch"],
+        default="numpy",
+        help="Voxelization backend: numpy (default), open3d (faster CPU), torch (GPU)",
+    )
+
+    args = parser.parse_args()
+
+    seq_path = args.path.rstrip("/")
+    if args.output is None:
+        output_dir = os.path.dirname(seq_path)
+    else:
+        output_dir = args.output.rstrip("/")
+
+    sequences = args.sequences
+    if sequences is None:
+        sequences = ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10"]
+
+    print(f"Sequences path: {seq_path}")
+    print(f"Output dir: {output_dir}")
+    print(f"Voxel size: {args.voxel_size}")
+    print(f"Backend: {args.backend}")
+    print(f"Sequences: {sequences}")
+
+    generate_sequence_map(
+        seq_path=seq_path,
+        output_dir=output_dir,
+        voxel_size=args.voxel_size,
+        sequences=sequences,
+        backend=args.backend,
+    )
+
+    print(f"\nDone. Ground truth saved to {output_dir}/ground_truth/")
+
+
+if __name__ == "__main__":
+    main()
