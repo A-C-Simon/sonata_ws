@@ -1,0 +1,22 @@
+# Refinement Network Configuration
+
+# Data
+data_path: "Datasets/SemanticKITTI/dataset"
+coarse_voxel_size: 0.1   # Simulates diffusion output resolution
+fine_voxel_size: 0.05    # Target resolution
+max_points_coarse: 10000  # Keep moderate for Chamfer memory
+max_points_fine: 30000
+
+# Model
+up_factor: 6  # Points per input point (LiDiff uses 6)
+
+# Training
+num_epochs: 50
+batch_size: 4
+num_workers: 4
+lr: 0.0001
+save_freq: 5
+
+# Output
+output_dir: "checkpoints/refinement"
+log_dir: "logs/refinement"

@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.sonata_encoder import SonataEncoder, ConditionalFeatureExtractor
 from models.diffusion_module import SceneCompletionDiffusion
+from models.refinement_net import RefinementNetwork
 from utils.checkpoint import load_checkpoint
 
 
@@ -46,7 +47,14 @@ def parse_args():
         '--voxel_size', type=float, default=0.05,
         help='Voxel size for processing'
     )
-    
+    parser.add_argument(
+        '--refinement_ckpt', type=str, default=None,
+        help='Optional refinement checkpoint to densify output'
+    )
+    parser.add_argument(
+        '--up_factor', type=int, default=6,
+        help='Refinement up_factor (if using refinement)'
+    )
     return parser.parse_args()
 
 
@@ -232,6 +240,18 @@ def main():
     completed = complete_scene(
         model, partial_data, num_steps=args.denoising_steps
     )
+    
+    # Optional refinement
+    if args.refinement_ckpt and os.path.exists(args.refinement_ckpt):
+        print("Applying refinement network...")
+        refinement = RefinementNetwork(up_factor=args.up_factor).cuda()
+        ckpt = load_checkpoint(args.refinement_ckpt)
+        refinement.load_state_dict(ckpt.get('model_state_dict', ckpt))
+        refinement.eval()
+        completed_t = torch.from_numpy(completed).float().cuda()
+        with torch.no_grad():
+            completed = refinement(completed_t).cpu().numpy()
+        print(f"Refined to {completed.shape[0]} points")
     
     # Uncenter
     completed = completed + center

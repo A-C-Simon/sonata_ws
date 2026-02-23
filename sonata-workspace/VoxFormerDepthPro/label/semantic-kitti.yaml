@@ -1,0 +1,98 @@
+# SemanticKITTI config for SSC (from VoxFormer)
+nbr_classes: 20
+grid_dims: [256, 32, 256]
+labels:
+  0: "unlabeled"
+  1: "outlier"
+  10: "car"
+  11: "bicycle"
+  13: "bus"
+  15: "motorcycle"
+  16: "on-rails"
+  18: "truck"
+  20: "other-vehicle"
+  30: "person"
+  31: "bicyclist"
+  32: "motorcyclist"
+  40: "road"
+  44: "parking"
+  48: "sidewalk"
+  49: "other-ground"
+  50: "building"
+  51: "fence"
+  52: "other-structure"
+  60: "lane-marking"
+  70: "vegetation"
+  71: "trunk"
+  72: "terrain"
+  80: "pole"
+  81: "traffic-sign"
+  99: "other-object"
+  252: "moving-car"
+  253: "moving-bicyclist"
+  254: "moving-person"
+  255: "moving-motorcyclist"
+  256: "moving-on-rails"
+  257: "moving-bus"
+  258: "moving-truck"
+  259: "moving-other-vehicle"
+learning_map:
+  0: 0
+  1: 0
+  10: 1
+  11: 2
+  13: 5
+  15: 3
+  16: 5
+  18: 4
+  20: 5
+  30: 6
+  31: 7
+  32: 8
+  40: 9
+  44: 10
+  48: 11
+  49: 12
+  50: 13
+  51: 14
+  52: 0
+  60: 9
+  70: 15
+  71: 16
+  72: 17
+  80: 18
+  81: 19
+  99: 0
+  252: 1
+  253: 7
+  254: 6
+  255: 8
+  256: 5
+  257: 5
+  258: 4
+  259: 5
+learning_map_inv:
+  0: 0
+  1: 10
+  2: 11
+  3: 15
+  4: 18
+  5: 20
+  6: 30
+  7: 31
+  8: 32
+  9: 40
+  10: 44
+  11: 48
+  12: 49
+  13: 50
+  14: 51
+  15: 70
+  16: 71
+  17: 72
+  18: 80
+  19: 81
+split:
+  train: [0, 1, 2, 3, 4, 5, 6, 7, 9, 10]
+  valid: [8]
+  test: [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]

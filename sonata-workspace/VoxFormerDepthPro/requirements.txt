@@ -1,0 +1,3 @@
+# Use Sonata env; Depth Pro is not on PyPI. Install from GitHub:
+#   git clone https://github.com/apple/ml-depth-pro.git && cd ml-depth-pro && pip install -e .
+#   source get_pretrained_models.sh  # downloads weights to checkpoints/

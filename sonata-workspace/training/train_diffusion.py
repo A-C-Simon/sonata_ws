@@ -34,9 +34,9 @@ def parse_args():
     
     # Data
     parser.add_argument(
-        '--data_path', type=str, 
-        default='Datasets/SemanticKITTI/dataset',
-        help='Path to SemanticKITTI dataset'
+        '--data_path', type=str,
+        default=os.path.expanduser('~/Simon_ws/dataset/SemanticKITTI/dataset'),
+        help='Path to SemanticKITTI dataset root (sequences/, ground_truth/)'
     )
     parser.add_argument(
         '--batch_size', type=int, default=4,

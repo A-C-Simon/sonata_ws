@@ -10,10 +10,10 @@ from typing import Dict, Optional
 def save_checkpoint(
     path: str,
     model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler._LRScheduler,
-    epoch: int,
-    best_val_loss: float,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[object] = None,
+    epoch: int = 0,
+    best_val_loss: Optional[float] = None,
     additional_info: Optional[Dict] = None
 ):
     """
@@ -31,10 +31,13 @@ def save_checkpoint(
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'best_val_loss': best_val_loss,
     }
+    if optimizer is not None:
+        checkpoint['optimizer_state_dict'] = optimizer.state_dict()
+    if scheduler is not None:
+        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+    if best_val_loss is not None:
+        checkpoint['best_val_loss'] = best_val_loss
     
     if additional_info is not None:
         checkpoint.update(additional_info)

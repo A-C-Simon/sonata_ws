@@ -1,348 +1,197 @@
-# Semantic Scene Completion with Sonata-LiDiff
+## Sonata-LiDiff + VoxFormerDepthPro
 
-A learning pipeline for semantic scene completion that combines:
-- **Sonata**: Self-supervised Point Transformer V3 encoder for robust point representations
-- **LiDiff**: Diffusion-based scene completion framework
-- **SemanticKITTI**: Benchmark dataset for outdoor LiDAR scene understanding
+Unified workspace for:
 
-## Architecture Overview
+- **Sonata-LiDiff** – diffusion-based 3D semantic scene completion on SemanticKITTI.
+- **VoxFormerDepthPro** – RGB → Depth Pro → LiDAR-style point clouds for Sonata.
 
-```
-Input LiDAR Scan → Sonata Encoder → Diffusion Process → Scene Completion
-                        ↓
-                 Rich Point Features
-                        ↓
-              Conditional Generation
-                        ↓
-              Complete 3D Scene + Semantics
-```
+This repo is set up so you can:
 
-### Key Components
+- Train Sonata on **real LiDAR** (SemanticKITTI velodyne).
+- Train Sonata on **pseudo-LiDAR from RGB** (Depth Pro).
+- Compare both pipelines end-to-end with simple commands.
 
-1. **Sonata Encoder** (Point Transformer V3)
-   - Pre-trained on large-scale multi-dataset
-   - Hierarchical point cloud encoding
-   - Self-attention with efficient grouped vector attention
-   - Outputs rich, reliable point representations
+---
 
-2. **LiDiff Diffusion Framework**
-   - Point-wise local diffusion modeling with Sonata-style transformer blocks
-   - Uses grouped vector attention (replacing sparse convolutions)
-   - Learns neighborhood distributions via transformer attention
-   - Conditional generation from partial scans
-   - Refinement network for detail enhancement
+## 1. Environment
 
-3. **SemanticKITTI Integration**
-   - Outdoor driving scene completion
-   - 19 semantic classes
-   - Ground truth generation from sequential scans
-   - Standard benchmarking metrics
-
-## Project Structure
-
-```
-sonata_lidiff/
-├── configs/
-│   ├── sonata_encoder.yaml      # Sonata encoder configuration
-│   ├── diffusion_model.yaml     # Diffusion process configuration
-│   ├── refinement.yaml          # Refinement network configuration
-│   └── training.yaml            # Training hyperparameters
-├── data/
-│   ├── semantickitti.py         # SemanticKITTI dataset handler
-│   ├── preprocessing.py         # Data preprocessing pipeline
-│   ├── ground_truth.py          # GT generation from sequences
-│   └── augmentation.py          # Data augmentation
-├── models/
-│   ├── sonata_encoder.py        # Sonata encoder wrapper
-│   ├── diffusion_module.py      # Diffusion process implementation
-│   ├── refinement_net.py        # Refinement network
-│   └── complete_model.py        # Full pipeline integration
-├── training/
-│   ├── train.py                 # Main training script
-│   ├── train_diffusion.py       # Diffusion model training
-│   ├── train_refinement.py      # Refinement network training
-│   └── losses.py                # Loss functions
-├── evaluation/
-│   ├── metrics.py               # Evaluation metrics (IoU, completion)
-│   ├── evaluate.py              # Evaluation script
-│   └── visualize.py             # Visualization tools
-├── utils/
-│   ├── transforms.py            # Point cloud transformations
-│   ├── checkpoint.py            # Model checkpointing
-│   └── logger.py                # Training logging
-└── scripts/
-    ├── setup_dataset.sh         # Dataset download and setup
-    ├── generate_gt.sh           # Ground truth generation
-    └── run_training.sh          # Training launcher
-```
-
-## Installation
-
-### Prerequisites
-- Python 3.9+ (spconv-cu124 requires 3.9+)
-- CUDA 11.8+ / 12.x
-- PyTorch 2.0+
-
-### Environment Setup
-
-**Recommended: use the install script** (handles numpy/scipy compatibility):
+Create and activate your `sonata_lidiff` environment (if not already):
 
 ```bash
-conda create -n sonata_lidiff python=3.9 -y
 conda activate sonata_lidiff
-bash install_dependencies.sh
-```
-
-**Manual setup:**
-
-```bash
-# Create conda environment (Python 3.9+ for spconv-cu124)
-conda create -n sonata_lidiff python=3.9 -y
-conda activate sonata_lidiff
-
-# Install PyTorch (adjust for your CUDA version)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-
-# Install core dependencies (numpy<1.28 + scipy==1.11.4 for Open3D compatibility)
-pip install -r requirements.txt
-
-# Install Sonata encoder dependencies
-# torch-scatter: use PyG wheel matching your PyTorch version (conda build can ABI-mismatch)
-pip install torch-scatter -f "https://data.pyg.org/whl/torch-$(python -c 'import torch; print(torch.__version__)').html"
-pip install flash-attn --no-build-isolation  # optional
-pip install huggingface_hub timm
-
-# Install project
+cd ~/Simon_ws/sonata-workspace
 pip install -e .
 ```
 
-## Dataset Setup
+Depth Pro is installed separately (see `VoxFormerDepthPro/README.md`), and its checkpoints are under `~/Simon_ws/ml-depth-pro/checkpoints/`.
 
-### SemanticKITTI Dataset
+---
 
-1. **Download Dataset**
-```bash
-# Download from http://www.semantic-kitti.org/dataset.html
-# Organize as:
-# Datasets/SemanticKITTI/dataset/sequences/
-#   ├── 00/velodyne/, 00/labels/
-#   ├── 01/velodyne/, 01/labels/
-#   ├── ...
-#   └── 21/velodyne/, 21/labels/
+## 2. Datasets
+
+All KITTI / SemanticKITTI archives are assumed to be downloaded to:
+
+```text
+~/Simon_ws/dataset/
+  data_odometry_color.zip
+  data_odometry_velodyne.zip
+  data_odometry_labels.zip
+  data_odometry_calib.zip
+  data_odometry_poses.zip
+  data_odometry_voxels.zip
 ```
 
-2. **Generate Ground Truth Maps**
-```bash
-python data/ground_truth.py \
-  --dataset_path Datasets/SemanticKITTI/dataset/sequences/ \
-  --output_path Datasets/SemanticKITTI/ground_truth/ \
-  --sequences 00 01 02 03 04 05 06 07 09 10
+They have been extracted (once) into:
+
+```text
+~/Simon_ws/dataset/SemanticKITTI/dataset/
+  sequences/XX/
+    image_2/      # RGB
+    velodyne/     # LiDAR
+    labels/       # LiDAR labels
+    voxels/       # voxel labels + masks
+    calib.txt
+    poses.txt
+  poses/XX.txt    # original KITTI odometry poses
 ```
 
-This creates complete scene maps by aggregating sequential scans using poses.
+> Default paths in the code point to `~/Simon_ws/dataset/SemanticKITTI/dataset` and `~/Simon_ws/dataset/VoxFormerDepthPro_out`, so you rarely need to type them.
 
-## Training Pipeline
+For more dataset detail, see `VoxFormerDepthPro/DATASET_AND_RUN.md`.
 
-### Stage 1: Train Diffusion Model with Sonata Encoder
+---
 
-```bash
-python training/train_diffusion.py \
-  --config configs/diffusion_model.yaml \
-  --encoder_ckpt facebook/sonata \
-  --data_path Datasets/SemanticKITTI \
-  --output_dir checkpoints/diffusion \
-  --batch_size 4 \
-  --num_epochs 100 \
-  --learning_rate 1e-4
-```
+## 3. One‑command pipelines
 
-**Key Training Details:**
-- Freezes Sonata encoder initially (optional fine-tuning later)
-- Learns point-wise diffusion using transformer attention blocks
-- Uses Sonata-style grouped vector attention for local neighborhood processing
-- Uses ground truth complete scenes as targets
-- Conditional generation from partial LiDAR scans
-
-### Stage 2: Train Refinement Network
+From the repo root:
 
 ```bash
-python training/train_refinement.py \
-  --config configs/refinement.yaml \
-  --diffusion_ckpt checkpoints/diffusion/best_model.pth \
-  --data_path Datasets/SemanticKITTI \
-  --output_dir checkpoints/refinement \
-  --batch_size 4 \
-  --num_epochs 50
+cd ~/Simon_ws/sonata-workspace
+conda activate sonata_lidiff
 ```
 
-**Refinement Objectives:**
-- Detail enhancement of diffusion outputs
-- Semantic consistency enforcement
-- Boundary sharpening
-- Noise reduction
+### 3.1 LiDAR → Sonata (baseline, original velodyne)
 
-## Evaluation
+Runs:
+
+1. Generate ground truth maps from **LiDAR** (`map_from_scans.py`, GPU voxelization via PyTorch).
+2. Train **Sonata-LiDiff diffusion** on this LiDAR dataset.
+3. Train **refinement network** on the same data.
+
+Command:
 
 ```bash
-python evaluation/evaluate.py \
-  --diffusion_ckpt checkpoints/diffusion/best_model.pth \
-  --refinement_ckpt checkpoints/refinement/best_model.pth \
-  --data_path Datasets/SemanticKITTI \
-  --split test \
-  --output_dir results/
+python scripts/run_lidar_to_sonata.py
 ```
 
-**Metrics:**
-- **Scene Completion IoU** (Intersection over Union)
-- **Semantic Scene Completion (SSC) IoU**: Per-class and mean IoU
-- **Completion Accuracy** at 0.5cm, 0.2cm, 0.1cm thresholds
-- **Chamfer Distance**: Geometric accuracy
+Outputs:
 
-## Inference
+- Checkpoints: `checkpoints/diffusion_lidar`, `checkpoints/refinement_lidar`
+- Logs: `logs/diffusion_lidar`, `logs/refinement_lidar`
+- GT maps: `~/Simon_ws/dataset/SemanticKITTI/dataset/ground_truth/XX/*.npz`
+
+### 3.2 RGB → Depth Pro → Sonata (VoxFormerDepthPro + Sonata)
+
+Runs:
+
+1. **VoxFormerDepthPro**:
+   - Preprocess voxel labels.
+   - Depth Pro on RGB (`image_2/`) → depth maps (`.npy`).
+   - Depth → LiDAR-style point clouds (`.bin`).
+   - Assign voxel labels to Depth Pro point clouds.
+2. Build a **separate dataset root** for Depth Pro point clouds:
+   - `~/Simon_ws/dataset/sonata_depth_pro/` with `sequences/XX/{velodyne,labels,poses.txt,calib.txt}`.
+3. Generate **ground truth maps** from this dataset (`map_from_scans.py`, GPU voxelization).
+4. Train **Sonata-LiDiff diffusion** and **refinement** on this Depth‑Pro dataset.
+
+Command:
 
 ```bash
-python inference.py \
-  --input_scan /path/to/scan.bin \
-  --diffusion_ckpt checkpoints/diffusion/best_model.pth \
-  --refinement_ckpt checkpoints/refinement/best_model.pth \
-  --output /path/to/output.ply \
-  --visualize
+python scripts/run_depthpro_to_sonata.py
 ```
 
-## Configuration
+Outputs:
 
-### Key Hyperparameters
+- Depth Pro point clouds & labels:
+  - `~/Simon_ws/dataset/VoxFormerDepthPro_out/...`
+  - `~/Simon_ws/dataset/sonata_depth_pro/sequences/XX/{velodyne,labels,...}`
+- GT maps (Depth Pro dataset):
+  - `~/Simon_ws/dataset/sonata_depth_pro/ground_truth/XX/*.npz`
+- Checkpoints:
+  - `checkpoints/diffusion_depthpro`, `checkpoints/refinement_depthpro`
+- Logs:
+  - `logs/diffusion_depthpro`, `logs/refinement_depthpro`
 
-**Sonata Encoder:**
-```yaml
-encoder:
-  model: "sonata"
-  pretrained: "facebook/sonata"
-  freeze: true  # Freeze initially, fine-tune later
-  patch_size: [1024, 1024, 1024, 1024, 1024]
-  enable_flash: true
-  feature_dim: 384
-```
+---
 
-**Diffusion Process:**
-```yaml
-diffusion:
-  timesteps: 1000
-  noise_schedule: "cosine"
-  beta_start: 0.0001
-  beta_end: 0.02
-  conditioning: "encoder_features"
-  denoising_steps: 50  # Inference
-```
+## 4. Individual components (if you want to run them manually)
 
-**Training:**
-```yaml
-training:
-  batch_size: 4
-  learning_rate: 1e-4
-  weight_decay: 0.01
-  epochs: 100
-  warmup_epochs: 10
-  gradient_clip: 1.0
-```
+### 4.1 VoxFormerDepthPro
 
-## Technical Details
+Entry scripts (defaults use paths in `VoxFormerDepthPro/paths_config.py`):
 
-### Architecture Improvements
+- `scripts/1_prepare_labels.py` – voxel label preprocessing.
+- `scripts/2_run_depth_pro.py` – run Depth Pro on one sequence (`--seq 00` etc.).
+- `scripts/3_depth_to_pointcloud.py` – depth → `.bin` for multiple sequences.
+- `scripts/4_assign_labels_from_voxels.py` – voxel labels → per-point labels.
 
-**Transformer-based Diffusion Module:**
-- The diffusion denoising network now uses Sonata-style transformer blocks instead of sparse convolutions
-- **Grouped Vector Attention**: Efficient attention mechanism that processes features in groups
-- **Point-based Processing**: Works directly with point features and coordinates, no sparse tensor conversion needed
-- **Local Attention**: Each point attends to its k-nearest neighbors for efficient local processing
-- **Benefits**: More flexible than sparse convolutions, better captures long-range dependencies, easier to extend
+See `VoxFormerDepthPro/README.md` and `VoxFormerDepthPro/DATASET_AND_RUN.md` for details.
 
-### Sonata Encoder Integration
+### 4.2 Ground truth generation (`map_from_scans.py`)
 
-The Sonata encoder provides hierarchical point features:
-- **Level 0** (Input): Raw scan points
-- **Level 1-5**: Progressively downsampled with increased receptive field
-- **Features**: 384-dimensional embeddings per point
-- **Attention**: Efficient grouped vector attention
-
-### Diffusion Framework
-
-Following LiDiff's approach with Sonata-style transformer architecture:
-- **Forward Process**: Gradually adds Gaussian noise to complete scenes
-- **Reverse Process**: Learns to denoise using transformer blocks, conditioned on:
-  - Partial scan geometry
-  - Sonata encoder features
-  - Semantic class information
-- **Transformer-based Denoising**: Uses Sonata-style grouped vector attention blocks
-  - Replaces sparse convolutions with transformer attention mechanisms
-  - Processes points directly with local attention neighborhoods
-  - More flexible and expressive than sparse convolution-based approaches
-- **Point-wise Modeling**: Treats completion as local neighborhood prediction via attention
-
-### Loss Functions
-
-```python
-# Total loss
-L_total = L_diffusion + λ_sem * L_semantic + λ_geo * L_geometric
-
-# Diffusion loss (denoising score matching)
-L_diffusion = MSE(ε_θ(x_t, t, c), ε)
-
-# Semantic segmentation loss
-L_semantic = CrossEntropy(pred_classes, gt_classes)
-
-# Geometric consistency loss
-L_geometric = Chamfer(completed_points, gt_points)
-```
-
-## Results
-
-Expected performance on SemanticKITTI validation set:
-
-| Method | mIoU | Completion@0.2cm | Completion@0.1cm |
-|--------|------|------------------|------------------|
-| LiDiff (original) | - | 16.79 | 4.67 |
-| LiDiff + Refined | - | 22.99 | 13.40 |
-| **Sonata-LiDiff** (ours) | TBD | TBD | TBD |
-
-## Visualization
+Generates complete scene maps from sequential scans:
 
 ```bash
-# Visualize completion results
-python evaluation/visualize.py \
-  --input results/sequence_00/ \
-  --output visualizations/ \
-  --type comparison  # [completion, semantic, comparison]
+python data/map_from_scans.py \
+  --path   ~/Simon_ws/dataset/SemanticKITTI/dataset/sequences \
+  --output ~/Simon_ws/dataset/SemanticKITTI/dataset \
+  --voxel_size 0.1 \
+  --backend torch \
+  --sequences 00 01 02 03 04 05 06 07 08 09 10
 ```
 
-## Citations
+- Uses **GPU** if available when `--backend torch`.
+- Filters moving-object labels (252–259) when labels are present.
 
-If you use this work, please cite:
+### 4.3 Training scripts
 
-```bibtex
-@inproceedings{wu2025sonata,
-  title={Sonata: Self-Supervised Learning of Reliable Point Representations},
-  author={Wu, Xiaoyang and others},
-  booktitle={CVPR},
-  year={2025}
-}
+- Diffusion model:
 
-@inproceedings{nunes2024cvpr,
-  title={Scaling Diffusion Models to Real-World 3D LiDAR Scene Completion},
-  author={Nunes, Lucas and Marcuzzi, Rodrigo and Mersch, Benedikt and Behley, Jens and Stachniss, Cyrill},
-  booktitle={CVPR},
-  year={2024}
-}
-```
+  ```bash
+  python training/train_diffusion.py \
+    --data_path ~/Simon_ws/dataset/SemanticKITTI/dataset \
+    --output_dir checkpoints/diffusion_lidar \
+    --log_dir logs/diffusion_lidar
+  ```
 
-## License
+- Refinement network:
 
-- Code: MIT License
-- Sonata weights: CC-BY-NC 4.0 (non-commercial)
-- LiDiff code: MIT License
+  ```bash
+  python training/train_refinement.py \
+    --data_path ~/Simon_ws/dataset/SemanticKITTI/dataset \
+    --output_dir checkpoints/refinement_lidar \
+    --log_dir logs/refinement_lidar
+  ```
 
-## Acknowledgments
+Replace `--data_path` with `~/Simon_ws/dataset/sonata_depth_pro` to train on Depth Pro instead of LiDAR.
 
-- Sonata team at Meta Reality Labs
-- LiDiff team at University of Bonn
-- SemanticKITTI dataset maintainers
+---
+
+## 5. Comparison idea (LiDAR vs RGB→Depth Pro)
+
+After running both orchestration scripts:
+
+- **LiDAR‑trained models**:
+  - `checkpoints/diffusion_lidar`, `checkpoints/refinement_lidar`
+- **Depth‑Pro‑trained models**:
+  - `checkpoints/diffusion_depthpro`, `checkpoints/refinement_depthpro`
+
+You can now:
+
+- Use the same evaluation code / inference scripts (e.g. `inference.py`, `evaluation/`) with different checkpoints.
+- Compare how Sonata performs when:
+  - Input = original LiDAR scans vs.
+  - Input = point clouds reconstructed from RGB via Depth Pro.
+
+This is the core experiment this workspace is structured to support.
+
