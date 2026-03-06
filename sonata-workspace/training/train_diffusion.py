@@ -31,7 +31,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='Train Sonata-LiDiff for semantic scene completion'
     )
-    
+
     # Data
     parser.add_argument(
         '--data_path', type=str,
@@ -50,7 +50,7 @@ def parse_args():
         '--voxel_size', type=float, default=0.05,
         help='Voxel size for scene representation'
     )
-    
+
     # Model
     parser.add_argument(
         '--encoder_ckpt', type=str, default='facebook/sonata',
@@ -73,7 +73,7 @@ def parse_args():
         choices=['linear', 'cosine', 'sigmoid'],
         help='Noise schedule type'
     )
-    
+
     # Training
     parser.add_argument(
         '--num_epochs', type=int, default=100,
@@ -99,7 +99,7 @@ def parse_args():
         '--accumulation_steps', type=int, default=1,
         help='Gradient accumulation steps'
     )
-    
+
     # Output
     parser.add_argument(
         '--output_dir', type=str, default='checkpoints/diffusion',
@@ -117,21 +117,27 @@ def parse_args():
         '--eval_freq', type=int, default=1,
         help='Evaluate every N epochs'
     )
-    
+
     # Resume
     parser.add_argument(
         '--resume', type=str, default=None,
         help='Resume from checkpoint'
     )
-    
+
     # Config file
     parser.add_argument(
         '--config', type=str, default=None,
         help='Path to config YAML file'
     )
-    
+
+    # Precomputed features mode
+    parser.add_argument(
+        '--precomputed', action='store_true', default=False,
+        help='Use precomputed encoder features (skip encoder during training)'
+    )
+
     args = parser.parse_args()
-    
+
     # Load config from YAML if provided
     if args.config is not None and os.path.exists(args.config):
         with open(args.config, 'r') as f:
@@ -139,14 +145,63 @@ def parse_args():
         # Update args with config
         for key, value in config.items():
             setattr(args, key, value)
-    
+
     return args
 
 
-def build_model(args) -> SceneCompletionDiffusion:
+def build_model(args):
     """Build the complete scene completion model."""
-    
-    # Sonata encoder
+
+    if getattr(args, 'precomputed', False):
+        # Precomputed mode: lightweight model without encoder
+        from models.diffusion_module import DenoisingNetwork, DiffusionScheduler
+        print('Building model (precomputed features mode)...')
+
+        class PrecomputedModel(torch.nn.Module):
+            def __init__(self, denoiser, scheduler):
+                super().__init__()
+                self.denoiser = denoiser
+                self.scheduler = scheduler
+
+            def forward(self, partial_scan, complete_scan, complete_batch=None,
+                        return_loss=True, condition_features=None):
+                import torch.nn.functional as F
+                cond = condition_features
+                if complete_batch is not None:
+                    batch_size = complete_batch.max().item() + 1
+                else:
+                    batch_size = 1
+                t = torch.randint(0, self.scheduler.num_timesteps,
+                                  (batch_size,), device=complete_scan.device)
+                noise = torch.randn_like(complete_scan)
+                if complete_batch is not None:
+                    t_pp = t[complete_batch]
+                else:
+                    t_pp = t.expand(complete_scan.shape[0])
+                dev = complete_scan.device
+                sa = self.scheduler.sqrt_alphas_cumprod.to(dev)[t_pp].unsqueeze(-1)
+                som = self.scheduler.sqrt_one_minus_alphas_cumprod.to(dev)[t_pp].unsqueeze(-1)
+                noisy = sa * complete_scan + som * noise
+                pred = self.denoiser(noisy, complete_scan, t, {'features': cond})
+                if return_loss:
+                    return {'loss': F.mse_loss(pred, noise), 'pred_noise': pred}
+                return {'pred_noise': pred}
+
+        denoiser = DenoisingNetwork(
+            in_channels=3, condition_dim=256,
+            hidden_dims=[64, 128, 256, 512],
+            time_embed_dim=128, num_neighbors=16,
+        )
+        scheduler = DiffusionScheduler(args.num_timesteps, args.schedule)
+        model = PrecomputedModel(denoiser, scheduler)
+
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f'Total parameters: {total_params:,}')
+        print(f'Trainable parameters: {trainable_params:,}')
+        return model
+
+    # Full model with Sonata encoder
     print("Loading Sonata encoder...")
     encoder = SonataEncoder(
         pretrained=args.encoder_ckpt,
@@ -154,7 +209,7 @@ def build_model(args) -> SceneCompletionDiffusion:
         enable_flash=args.enable_flash,
         feature_levels=[2, 3, 4]
     )
-    
+
     # Conditional feature extractor
     print("Building conditional feature extractor...")
     condition_extractor = ConditionalFeatureExtractor(
@@ -162,7 +217,7 @@ def build_model(args) -> SceneCompletionDiffusion:
         feature_levels=[2, 3, 4],
         fusion_type="attention"
     )
-    
+
     # Complete diffusion model
     print("Building diffusion model...")
     model = SceneCompletionDiffusion(
@@ -172,7 +227,7 @@ def build_model(args) -> SceneCompletionDiffusion:
         schedule=args.schedule,
         denoising_steps=50
     )
-    
+
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(
@@ -180,7 +235,7 @@ def build_model(args) -> SceneCompletionDiffusion:
     )
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
-    
+
     return model
 
 
@@ -193,18 +248,18 @@ def train_epoch(
     writer: SummaryWriter
 ) -> float:
     """Train for one epoch."""
-    
+
     model.train()
     total_loss = 0.0
-    
+
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
-    
+
     for i, batch in enumerate(pbar):
         # Move to GPU
         for key in batch:
             if isinstance(batch[key], torch.Tensor):
                 batch[key] = batch[key].cuda()
-        
+
         # Prepare input
         partial_scan = {
             'coord': batch['partial_coord'],
@@ -212,19 +267,29 @@ def train_epoch(
             'normal': batch['partial_normal'],
             'batch': batch['partial_batch'],
         }
-        
+
         complete_coord = batch['complete_coord']
-        
+        complete_batch = batch.get('complete_batch')
+        if complete_batch is not None:
+            complete_batch = complete_batch.cuda()
+
+        cond_feat = batch.get('condition_features', None)
+        if cond_feat is not None:
+            cond_feat = cond_feat.cuda()
+            if cond_feat.dtype == torch.float16:
+                cond_feat = cond_feat.float()
+
         # Forward pass
-        output = model(partial_scan, complete_coord, return_loss=True)
+        output = model(partial_scan, complete_coord, complete_batch,
+                       return_loss=True, condition_features=cond_feat)
         loss = output['loss']
-        
+
         # Scale loss for gradient accumulation
         loss = loss / args.accumulation_steps
-        
+
         # Backward pass
         loss.backward()
-        
+
         # Update weights
         if (i + 1) % args.accumulation_steps == 0:
             # Gradient clipping
@@ -232,18 +297,17 @@ def train_epoch(
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), args.gradient_clip
                 )
-            
             optimizer.step()
             optimizer.zero_grad()
-        
+
         # Logging
         total_loss += loss.item() * args.accumulation_steps
         pbar.set_postfix({'loss': loss.item() * args.accumulation_steps})
-        
+
         # TensorBoard logging
         step = epoch * len(dataloader) + i
         writer.add_scalar('train/loss', loss.item(), step)
-    
+
     avg_loss = total_loss / len(dataloader)
     return avg_loss
 
@@ -257,18 +321,18 @@ def validate(
     writer: SummaryWriter
 ) -> float:
     """Validate the model."""
-    
+
     model.eval()
     total_loss = 0.0
-    
+
     pbar = tqdm(dataloader, desc=f"Validation")
-    
+
     for i, batch in enumerate(pbar):
         # Move to GPU
         for key in batch:
             if isinstance(batch[key], torch.Tensor):
                 batch[key] = batch[key].cuda()
-        
+
         # Prepare input
         partial_scan = {
             'coord': batch['partial_coord'],
@@ -276,56 +340,69 @@ def validate(
             'normal': batch['partial_normal'],
             'batch': batch['partial_batch'],
         }
-        
+
         complete_coord = batch['complete_coord']
-        
+        complete_batch = batch.get('complete_batch')
+        if complete_batch is not None:
+            complete_batch = complete_batch.cuda()
+
+        cond_feat = batch.get('condition_features', None)
+        if cond_feat is not None:
+            cond_feat = cond_feat.cuda()
+            if cond_feat.dtype == torch.float16:
+                cond_feat = cond_feat.float()
+
         # Forward pass
-        output = model(partial_scan, complete_coord, return_loss=True)
+        output = model(partial_scan, complete_coord, complete_batch,
+                       return_loss=True, condition_features=cond_feat)
         loss = output['loss']
-        
+
         total_loss += loss.item()
         pbar.set_postfix({'loss': loss.item()})
-    
+
     avg_loss = total_loss / len(dataloader)
-    
+
     # TensorBoard logging
     writer.add_scalar('val/loss', avg_loss, epoch)
-    
+
     return avg_loss
 
 
 def main():
     args = parse_args()
-    
+
     # Create output directories
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
-    
+
     # Setup logger
     logger = setup_logger(args.output_dir)
     logger.info(f"Arguments: {args}")
-    
+
     # TensorBoard
     writer = SummaryWriter(args.log_dir)
-    
+
     # Build datasets
     print("\nLoading datasets...")
+    use_precomputed = getattr(args, 'precomputed', False)
     train_dataset = SemanticKITTI(
         root=args.data_path,
         split='train',
         voxel_size=args.voxel_size,
         use_ground_truth_maps=True,
-        augmentation=True
+        augmentation=not use_precomputed,
+        use_precomputed=use_precomputed,
     )
-    
+
     val_dataset = SemanticKITTI(
         root=args.data_path,
         split='val',
         voxel_size=args.voxel_size,
         use_ground_truth_maps=True,
-        augmentation=False
+        augmentation=False,
+        use_precomputed=use_precomputed,
     )
-    
+
     # Data loaders
     train_loader = DataLoader(
         train_dataset,
@@ -335,7 +412,7 @@ def main():
         collate_fn=collate_fn,
         pin_memory=True
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
@@ -344,29 +421,29 @@ def main():
         collate_fn=collate_fn,
         pin_memory=True
     )
-    
+
     print(f"Train samples: {len(train_dataset)}")
     print(f"Val samples: {len(val_dataset)}")
-    
+
     # Build model
     model = build_model(args).cuda()
-    
+
     # Optimizer
     optimizer = optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
         weight_decay=args.weight_decay
     )
-    
+
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.num_epochs, eta_min=1e-6
     )
-    
+
     # Resume from checkpoint
     start_epoch = 0
     best_val_loss = float('inf')
-    
+
     if args.resume is not None:
         print(f"\nResuming from {args.resume}")
         checkpoint = load_checkpoint(args.resume)
@@ -375,27 +452,27 @@ def main():
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-    
+
     # Training loop
     print("\nStarting training...")
     for epoch in range(start_epoch, args.num_epochs):
         logger.info(f"\n{'='*50}")
         logger.info(f"Epoch {epoch}/{args.num_epochs}")
         logger.info(f"{'='*50}")
-        
+
         # Train
         train_loss = train_epoch(
             model, train_loader, optimizer, epoch, args, writer
         )
         logger.info(f"Train loss: {train_loss:.6f}")
-        
+
         # Validate
         if (epoch + 1) % args.eval_freq == 0:
             val_loss = validate(
                 model, val_loader, epoch, args, writer
             )
             logger.info(f"Val loss: {val_loss:.6f}")
-            
+
             # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -403,35 +480,35 @@ def main():
                     args.output_dir, 'best_model.pth'
                 )
                 save_checkpoint(
-                    save_path, model, optimizer, scheduler, 
+                    save_path, model, optimizer, scheduler,
                     epoch, best_val_loss
                 )
                 logger.info(f"Saved best model to {save_path}")
-        
+
         # Save periodic checkpoint
         if (epoch + 1) % args.save_freq == 0:
             save_path = os.path.join(
                 args.output_dir, f'checkpoint_epoch_{epoch}.pth'
             )
             save_checkpoint(
-                save_path, model, optimizer, scheduler, 
+                save_path, model, optimizer, scheduler,
                 epoch, best_val_loss
             )
             logger.info(f"Saved checkpoint to {save_path}")
-        
+
         # Update learning rate
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
         writer.add_scalar('train/learning_rate', current_lr, epoch)
-    
+
     # Save final model
     save_path = os.path.join(args.output_dir, 'final_model.pth')
     save_checkpoint(
-        save_path, model, optimizer, scheduler, 
+        save_path, model, optimizer, scheduler,
         args.num_epochs - 1, best_val_loss
     )
     logger.info(f"\nTraining completed! Final model saved to {save_path}")
-    
+
     writer.close()
 
 
