@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-End-to-end pipeline for LiDAR-only SemanticKITTI:
+End-to-end pipeline for LiDAR-only SemanticKITTI (вариант 1: минимум места, один проход map_from_scans).
 
-  velodyne + labels + poses + calib
-    -> ground_truth maps (map_from_scans)
-    -> Sonata-LiDiff training (diffusion + refinement)
+  1) map_from_scans --save_only_map_world  → ground_truth/XX/map_world.npz (один раз)
+  2) precompute_voxelized_dataset --backend torch [--max_map_points 2M]  → voxelized_cache/XX/*.npz
+  3) train_diffusion + train_refinement с --voxelized_cache_dir
 
-Run from project root:
-  cd ~/Simon_ws/sonata-workspace
+Запуск из корня репозитория:
   python scripts/run_lidar_to_sonata.py
 """
 
@@ -50,7 +49,7 @@ def main():
     )
 
     voxelized_cache = os.path.join(kitti_dataset_root, "voxelized_cache")
-    print("\n=== 1.5) Precompute voxelized cache (optional, speeds up training) ===")
+    print("\n=== 1.5) Precompute voxelized cache (map_world -> SК кадров, GPU) ===")
     run(
         [
             "python",
@@ -61,6 +60,10 @@ def main():
             voxelized_cache,
             "--voxel_size",
             "0.05",
+            "--backend",
+            "torch",
+            "--max_map_points",
+            "2000000",
             "--sequences",
             *sequences,
         ],

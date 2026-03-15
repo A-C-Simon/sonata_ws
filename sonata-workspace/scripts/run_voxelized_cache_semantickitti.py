@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Plan B: build voxelized cache for SemanticKITTI (faster training).
+Вариант 1: минимум места, один проход map_from_scans. Строит вокселизованный кэш.
 
-  1) map_from_scans with --save_only_map_world → ground_truth/XX/map_world.npz
-  2) precompute_voxelized_dataset → voxelized_cache/XX/{scan_id}.npz
+  1) map_from_scans --save_only_map_world  → ground_truth/XX/map_world.npz (один раз)
+  2) precompute_voxelized_dataset --backend torch [--max_map_points 2M]  → voxelized_cache/XX/*.npz
 
-Then train with --voxelized_cache_dir pointing to the cache.
+Дальше: обучение с --voxelized_cache_dir (команда выводится в конце).
 
-Run from project root:
+Запуск из корня репозитория:
   python scripts/run_voxelized_cache_semantickitti.py --data_path /path/to/SemanticKITTI/dataset
-  # If map_world already exists:
-  python scripts/run_voxelized_cache_semantickitti.py --data_path /path/to/dataset --skip_map
+Если map_world уже есть: добавьте --skip_map
 """
 
 import argparse
@@ -63,7 +62,23 @@ def main():
         type=str,
         default="torch",
         choices=["numpy", "open3d", "torch"],
-        help="Voxelization backend for map_from_scans",
+        help="Voxelization backend for map_from_scans and precompute",
+    )
+    parser.add_argument(
+        "--max_map_points",
+        type=int,
+        default=2_000_000,
+        help="Max points from map per frame (subsample if larger; speeds up and increases GPU use)",
+    )
+    parser.add_argument(
+        "--skip_existing",
+        action="store_true",
+        help="In precompute: skip frames that already have cache .npz (resume-friendly)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Pass --verbose to precompute (per-frame progress)",
     )
     args = parser.parse_args()
 
@@ -96,21 +111,28 @@ def main():
         print("=== 1) Skipping map_from_scans (--skip_map) ===")
 
     print("\n=== 2) precompute_voxelized_dataset ===")
-    run(
-        [
-            "python",
-            "data/precompute_voxelized_dataset.py",
-            "--data_path",
-            data_path,
-            "--output_dir",
-            voxelized_cache,
-            "--voxel_size",
-            str(args.voxel_size_cache),
-            "--sequences",
-            *args.sequences,
-        ],
-        cwd=repo_root,
-    )
+    precompute_backend = "torch" if args.backend == "torch" else "numpy"
+    precompute_cmd = [
+        "python",
+        "data/precompute_voxelized_dataset.py",
+        "--data_path",
+        data_path,
+        "--output_dir",
+        voxelized_cache,
+        "--voxel_size",
+        str(args.voxel_size_cache),
+        "--backend",
+        precompute_backend,
+        "--max_map_points",
+        str(args.max_map_points),
+        "--sequences",
+        *args.sequences,
+    ]
+    if args.skip_existing:
+        precompute_cmd.append("--skip_existing")
+    if args.verbose:
+        precompute_cmd.append("--verbose")
+    run(precompute_cmd, cwd=repo_root)
 
     print("\n" + "=" * 60)
     print("Plan B cache ready. Train with:")

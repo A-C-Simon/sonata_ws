@@ -84,6 +84,110 @@ def voxelize(points: np.ndarray, labels: np.ndarray, voxel_size: float):
     return centers, out_labels
 
 
+def _voxel_centers_merge_duplicates(centers: np.ndarray, voxel_size: float) -> np.ndarray:
+    """Merge duplicate voxel centers (e.g. after chunked GPU voxelization)."""
+    coords = np.floor(centers / voxel_size).astype(np.int32)
+    unique_coords = np.unique(coords, axis=0)
+    return (unique_coords.astype(np.float32) * voxel_size + voxel_size / 2).astype(np.float32)
+
+
+def transform_points_gpu(
+    points: np.ndarray,
+    T: np.ndarray,
+    chunk_size: int = 10_000_000,
+) -> np.ndarray:
+    """Transform points (N, 3) by 4x4 matrix T on GPU: p_homo = (x,y,z,1), out = (T @ p_homo)[:3]. Returns (N, 3) float32."""
+    try:
+        import torch
+    except ImportError:
+        ones = np.ones((points.shape[0], 1), dtype=np.float32)
+        pts = np.hstack([points, ones])
+        return (T @ pts.T).T[:, :3].astype(np.float32)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    T_t = torch.from_numpy(T.astype(np.float32)).to(dev)
+    n = points.shape[0]
+    out_list = []
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        chunk = points[start:end].astype(np.float32)
+        ones = np.ones((chunk.shape[0], 1), dtype=np.float32)
+        pts = np.hstack([chunk, ones])  # (M, 4)
+        pts_t = torch.from_numpy(pts).to(dev, non_blocking=True)
+        # (M, 4) @ (4, 4)^T = (M, 4)
+        out_t = pts_t @ T_t.T
+        out_list.append(out_t[:, :3].cpu().numpy())
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+    return np.vstack(out_list).astype(np.float32)
+
+
+def voxelize_centers_torch(
+    points: np.ndarray,
+    voxel_size: float,
+    device: str = "cuda",
+    chunk_size: int = 10_000_000,
+) -> np.ndarray:
+    """Voxelize on GPU (centers only, no labels). Returns (N, 3) float32."""
+    try:
+        import torch
+    except ImportError:
+        return (voxelize(points, np.zeros(points.shape[0], dtype=np.int32), voxel_size))[0]
+    dev = torch.device(device if torch.cuda.is_available() else "cpu")
+    n_points = points.shape[0]
+    if n_points == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    all_centers = []
+    for start in range(0, n_points, chunk_size):
+        end = min(start + chunk_size, n_points)
+        chunk = points[start:end].astype(np.float32)
+        pts = torch.from_numpy(chunk).to(dev, non_blocking=True)
+        coords = (pts / voxel_size).floor().to(torch.int32)
+        del pts
+        unique_coords = torch.unique(coords, dim=0)
+        del coords
+        centers = unique_coords.float() * voxel_size + voxel_size / 2
+        del unique_coords
+        all_centers.append(centers.cpu().numpy())
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+    merged = np.vstack(all_centers)
+    return _voxel_centers_merge_duplicates(merged, voxel_size)
+
+
+def voxelize_centers_torch_from_tensor(
+    pts_tensor,
+    voxel_size: float,
+    chunk_size: int = 4_000_000,
+):
+    """Voxelize tensor (N, 3) on same device; returns numpy (K, 3) float32. Keeps work on GPU."""
+    import torch
+    dev = pts_tensor.device
+    n = pts_tensor.shape[0]
+    if n == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    all_centers = []
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        chunk = pts_tensor[start:end]
+        coords = (chunk / voxel_size).floor().to(torch.int32)
+        unique_coords = torch.unique(coords, dim=0)
+        centers = unique_coords.float() * voxel_size + voxel_size / 2
+        all_centers.append(centers.cpu().numpy())
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+    merged = np.vstack(all_centers)
+    return _voxel_centers_merge_duplicates(merged, voxel_size)
+
+
+def _voxelize_complete_cpu(complete: np.ndarray, voxel_size: float, backend: str):
+    """Voxelize complete cloud (no labels). Returns (centers, zeros labels)."""
+    if backend == "torch":
+        coord = voxelize_centers_torch(complete, voxel_size)
+    else:
+        coord, _ = voxelize(complete, np.zeros(complete.shape[0], dtype=np.int32), voxel_size)
+    return coord, np.zeros(coord.shape[0], dtype=np.int32)
+
+
 def height_to_color(z: np.ndarray) -> np.ndarray:
     """ (N,) -> (N, 3) RGB from height."""
     z = np.asarray(z, dtype=np.float32)
@@ -108,10 +212,17 @@ def process_frame(
     poses: np.ndarray,
     voxel_size: float,
     max_points: int,
+    backend: str = "numpy",
+    map_homo_gpu=None,
+    device=None,
+    gt_npz_path: str = None,
 ) -> dict:
-    """Compute partial + complete voxelized for one frame. Returns dict of numpy arrays."""
+    """Compute partial + complete voxelized for one frame. Returns dict of numpy arrays.
+    When map_homo_gpu and device are provided (backend torch), transform and voxelize stay on GPU.
+    When gt_npz_path is provided (per-frame npz from map_from_scans sliding window), complete is
+    loaded from that file (already in scan frame), no map_world transform — fast path.
+    """
     seq_path = os.path.join(data_path, "sequences", seq)
-    gt_path = os.path.join(data_path, "ground_truth", seq)
 
     # Scan
     bin_path = os.path.join(seq_path, "velodyne", f"{scan_id}.bin")
@@ -125,18 +236,38 @@ def process_frame(
     scan_center = scan.mean(axis=0).astype(np.float32)
     scan = scan - scan_center
 
-    # Map in scan frame
-    if frame_idx >= poses.shape[0]:
+    # Complete: from per-frame npz (fast), or from map_world (GPU or CPU)
+    if gt_npz_path and os.path.isfile(gt_npz_path):
+        # Fast path: map_from_scans already wrote ground_truth/XX/{scan_id}.npz (scan frame, ≤200k pts)
+        gt_data = np.load(gt_npz_path)
+        complete = gt_data["points"].astype(np.float32) if "points" in gt_data else gt_data[list(gt_data.keys())[0]].astype(np.float32)
+        if complete.ndim == 3:
+            complete = complete.reshape(-1, 3)
+        complete = complete - scan_center
+        complete_coord, complete_labels = _voxelize_complete_cpu(complete, voxel_size, backend)
+    elif frame_idx >= poses.shape[0]:
         complete = scan.copy()
+        complete_coord, complete_labels = _voxelize_complete_cpu(complete, voxel_size, backend)
+    elif map_homo_gpu is not None and device is not None:
+        import torch
+        Tinv = np.linalg.inv(poses[frame_idx])
+        Tinv_gpu = torch.from_numpy(Tinv.astype(np.float32)).to(device)
+        scan_center_gpu = torch.from_numpy(scan_center).to(device)
+        complete_gpu = (map_homo_gpu @ Tinv_gpu.T)[:, :3] - scan_center_gpu
+        complete_coord = voxelize_centers_torch_from_tensor(complete_gpu, voxel_size)
+        complete_labels = np.zeros(complete_coord.shape[0], dtype=np.int32)
     else:
         Tinv = np.linalg.inv(poses[frame_idx])
-        ones = np.ones((map_world.shape[0], 1), dtype=np.float32)
-        pts = np.hstack([map_world, ones])
-        complete = (Tinv @ pts.T).T[:, :3].astype(np.float32) - scan_center
+        if backend == "torch" and map_world.shape[0] > 500_000:
+            complete = transform_points_gpu(map_world, Tinv) - scan_center
+        else:
+            ones = np.ones((map_world.shape[0], 1), dtype=np.float32)
+            pts = np.hstack([map_world, ones])
+            complete = (Tinv @ pts.T).T[:, :3].astype(np.float32) - scan_center
+        complete_coord, complete_labels = _voxelize_complete_cpu(complete, voxel_size, backend)
 
-    # Voxelize
+    # Voxelize partial (always CPU for majority-vote labels)
     partial_coord, partial_labels = voxelize(scan, labels_scan, voxel_size)
-    complete_coord, complete_labels = voxelize(complete, np.zeros(complete.shape[0], dtype=np.int32), voxel_size)
 
     # Subsample
     if partial_coord.shape[0] > max_points:
@@ -198,6 +329,24 @@ def main():
         default=True,
         help="Skip frames that already have an npz",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print each frame id while processing (so you see progress when each frame is slow)",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="numpy",
+        choices=["numpy", "torch"],
+        help="Voxelization backend for 'complete' cloud: numpy (default) or torch (GPU if available)",
+    )
+    parser.add_argument(
+        "--max_map_points",
+        type=int,
+        default=2_000_000,
+        help="Max points from map_world to use per frame (subsample if larger; like map_from_scans). Speeds up and increases GPU use (default 2M).",
+    )
     args = parser.parse_args()
 
     if args.output_dir is None:
@@ -206,6 +355,19 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     total = 0
 
+    # CUDA status (so user sees if GPU is used)
+    try:
+        import torch
+        cuda_ok = torch.cuda.is_available()
+        if cuda_ok and args.backend == "torch":
+            print(f"GPU: {torch.cuda.get_device_name(0)} (CUDA available, using for transform + voxelize)")
+        elif args.backend == "torch":
+            print("GPU: CUDA not available, --backend torch will use CPU")
+        else:
+            print("GPU: not used (backend=numpy)")
+    except Exception:
+        print("GPU: could not check (install PyTorch to use --backend torch)")
+
     for seq in args.sequences:
         seq_path = os.path.join(args.data_path, "sequences", seq)
         velo_dir = os.path.join(seq_path, "velodyne")
@@ -213,15 +375,47 @@ def main():
             print(f"Skip seq {seq}: no {velo_dir}")
             continue
 
-        map_npz = os.path.join(args.data_path, "ground_truth", seq, "map_world.npz")
-        if not os.path.isfile(map_npz):
-            print(f"Skip seq {seq}: no {map_npz} (run map_from_scans first)")
+        gt_seq_dir = os.path.join(args.data_path, "ground_truth", seq)
+        map_npz = os.path.join(gt_seq_dir, "map_world.npz")
+        has_map_world = os.path.isfile(map_npz)
+        has_per_frame = False
+        if os.path.isdir(gt_seq_dir):
+            for f in os.listdir(gt_seq_dir):
+                if f.endswith(".npz") and f != "map_world.npz":
+                    has_per_frame = True
+                    break
+        if not has_map_world and not has_per_frame:
+            print(f"Skip seq {seq}: no {map_npz} and no per-frame npz (run map_from_scans first)")
             continue
+        if has_per_frame:
+            print(f"  seq {seq}: using per-frame ground_truth/*.npz (fast path, no map_world transform)")
 
-        data = np.load(map_npz)
-        map_world = data["points"].astype(np.float32) if "points" in data else data[list(data.keys())[0]].astype(np.float32)
-        if map_world.ndim == 3:
-            map_world = map_world.reshape(-1, 3)
+        map_world = None
+        map_homo_gpu = None
+        device = None
+        if has_map_world:
+            data = np.load(map_npz)
+            map_world = data["points"].astype(np.float32) if "points" in data else data[list(data.keys())[0]].astype(np.float32)
+            if map_world.ndim == 3:
+                map_world = map_world.reshape(-1, 3)
+            n_map = map_world.shape[0]
+            if n_map > args.max_map_points:
+                rng = np.random.default_rng(int(seq) if seq.isdigit() else 42)
+                idx = rng.choice(n_map, args.max_map_points, replace=False)
+                map_world = map_world[idx]
+                print(f"  seq {seq}: subsampled map {n_map} -> {args.max_map_points} points (--max_map_points)")
+            n_map = map_world.shape[0]
+            if args.backend == "torch":
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        device = torch.device("cuda")
+                        ones = np.ones((n_map, 1), dtype=np.float32)
+                        map_homo = np.hstack([map_world, ones])
+                        map_homo_gpu = torch.from_numpy(map_homo).to(device, non_blocking=True)
+                        print(f"  seq {seq}: map on GPU ({n_map} points)")
+                except Exception as e:
+                    print(f"  seq {seq}: GPU map failed ({e}), using CPU path")
 
         pose_path = os.path.join(seq_path, "poses.txt")
         poses = load_poses(pose_path) if os.path.isfile(pose_path) else np.zeros((0, 4, 4))
@@ -230,26 +424,53 @@ def main():
         out_dir = os.path.join(args.output_dir, seq)
         os.makedirs(out_dir, exist_ok=True)
 
-        for frame_idx, fn in enumerate(tqdm(scan_files, desc=f"seq {seq}")):
+        for frame_idx, fn in enumerate(tqdm(
+            scan_files,
+            desc=f"seq {seq}",
+            mininterval=1.0,
+            miniters=1,
+        )):
             scan_id = os.path.splitext(fn)[0]
             out_path = os.path.join(out_dir, f"{scan_id}.npz")
             if args.skip_existing and os.path.isfile(out_path):
                 continue
+            gt_npz_path = os.path.join(gt_seq_dir, f"{scan_id}.npz")
+            if not has_per_frame:
+                gt_npz_path = None
+            elif not os.path.isfile(gt_npz_path):
+                gt_npz_path = None
+            if gt_npz_path is None and map_world is None:
+                continue
+            if args.verbose:
+                tqdm.write(f"  [{seq}] frame {frame_idx + 1}/{len(scan_files)} {scan_id}")
             try:
                 out = process_frame(
                     args.data_path,
                     seq,
                     scan_id,
                     frame_idx,
-                    map_world,
+                    map_world if map_world is not None else np.zeros((0, 3), dtype=np.float32),
                     poses,
                     args.voxel_size,
                     args.max_points,
+                    backend=args.backend,
+                    map_homo_gpu=map_homo_gpu,
+                    device=device,
+                    gt_npz_path=gt_npz_path,
                 )
                 np.savez_compressed(out_path, **out)
                 total += 1
             except Exception as e:
                 tqdm.write(f"Skip {seq}/{scan_id}: {e}")
+
+        if map_homo_gpu is not None:
+            del map_homo_gpu
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     print(f"Done. Saved {total} frames to {args.output_dir}")
 
