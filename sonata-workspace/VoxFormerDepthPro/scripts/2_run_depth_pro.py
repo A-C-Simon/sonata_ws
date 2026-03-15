@@ -10,11 +10,38 @@ from tqdm import tqdm
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-def run_sequence(image_dir, depth_dir, device="cuda"):
+def _ensure_depth_pro():
     try:
         import depth_pro
-    except ImportError:
-        raise ImportError("depth_pro not installed. pip install depth-pro")
+        return depth_pro
+    except ImportError as e:
+        last_err = e
+    # Fallback: use ml-depth-pro from /workspace/ml-depth-pro/src if present
+    for candidate in ["/workspace/ml-depth-pro/src", os.path.expanduser("~/ml-depth-pro/src")]:
+        if not candidate or not os.path.isdir(candidate):
+            continue
+        if candidate in sys.path:
+            try:
+                import depth_pro
+                return depth_pro
+            except ImportError as e:
+                last_err = e
+            continue
+        sys.path.insert(0, candidate)
+        try:
+            import depth_pro
+            return depth_pro
+        except ImportError as e:
+            last_err = e
+        except Exception as e:
+            last_err = e
+    raise ImportError(
+        "depth_pro not found. Install: cd /workspace/ml-depth-pro && pip install . "
+        "Or ensure /workspace/ml-depth-pro/src exists. Last error: %s" % (last_err,)
+    ) from last_err
+
+def run_sequence(image_dir, depth_dir, device="cuda"):
+    depth_pro = _ensure_depth_pro()
     os.makedirs(depth_dir, exist_ok=True)
     model, transform = depth_pro.create_model_and_transforms()
     model = model.to(device).eval()

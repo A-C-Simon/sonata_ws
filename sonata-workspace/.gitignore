@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.eggs/
+*.egg-info/
+*.egg
+.venv/
+venv/
+env/
+
+# Build / install
+dist/
+build/
+*.egg
+
+# Checkpoints and logs
+checkpoints/
+logs/
+*.pt
+*.pth
+*.ckpt
+
+# Data artifacts (large files)
+*.npy
+*.npz
+*.bin
+*.pkl
+*.label
+
+# Pipeline / runs
+pipeline.log
+nohup.out
+*.log
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Optional: local dataset symlinks or copies inside repo (if any)
+# dataset/
+# VoxFormerDepthPro/

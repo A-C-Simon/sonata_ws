@@ -12,12 +12,14 @@ Runs:
   3) Generates ground-truth maps with map_from_scans (GPU backend if available)
   4) Trains Sonata-LiDiff (diffusion + refinement) on that dataset
 
-Run from project root:
-  cd ~/Simon_ws/sonata-workspace
+Run from project root (set env for your paths):
+  export dataset=/workspace/dataset OUT=/workspace/dataset
+  cd /workspace/sonata-workspace
   python scripts/run_depthpro_to_sonata.py
 """
 
 import os
+import sys
 import subprocess
 from typing import List
 
@@ -29,36 +31,98 @@ def run(cmd: List[str], cwd: str) -> None:
 
 def main():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, repo_root)
+    from VoxFormerDepthPro.paths_config import (
+        DEFAULT_KITTI_ROOT,
+        DEFAULT_VOXFORMER_OUT,
+        OUT_ROOT,
+        get_preprocess_root,
+    )
 
-    # Paths (match paths_config defaults)
-    workspace_dataset = os.path.expanduser("~/Simon_ws/dataset")
-    kitti_root = os.path.join(workspace_dataset, "SemanticKITTI")
-    vox_out_root = os.path.join(workspace_dataset, "VoxFormerDepthPro_out")
-    sonata_dp_root = os.path.join(workspace_dataset, "sonata_depth_pro")
+    # KITTI = $dataset/SemanticKITTI, VoxFormer out = $OUT/VoxFormerDepthPro
+    kitti_root = DEFAULT_KITTI_ROOT
+    vox_out_root = DEFAULT_VOXFORMER_OUT
+    sonata_dp_root = os.path.join(OUT_ROOT, "sonata_depth_pro")
+    # Depth Pro loads ./checkpoints/depth_pro.pt relative to cwd; use ml-depth-pro root
+    depth_pro_root = os.environ.get("DEPTH_PRO_ROOT", "/workspace/ml-depth-pro")
 
     sequences = [f"{i:02d}" for i in range(11)]  # 00–10
 
+    # Step 1: skip if preprocess output already exists for all sequences
+    preprocess_root = get_preprocess_root()
+    def preprocess_done():
+        for seq in sequences:
+            lbl_dir = os.path.join(preprocess_root, "labels", seq)
+            if not os.path.isdir(lbl_dir):
+                return False
+            if not any(f.endswith(".npy") for f in os.listdir(lbl_dir)):
+                return False
+        return True
+
+    # Step 2: depth/sequences/XX/*.npy — skip only if count matches image_2 (avoid partial runs)
+    depth_root = os.path.join(vox_out_root, "depth", "sequences")
+    image2_root = os.path.join(kitti_root, "dataset", "sequences")
+    def depth_done_for(seq):
+        depth_dir = os.path.join(depth_root, seq)
+        image_dir = os.path.join(image2_root, seq, "image_2")
+        if not os.path.isdir(depth_dir):
+            return False
+        n_depth = len([f for f in os.listdir(depth_dir) if f.endswith(".npy")])
+        if n_depth == 0:
+            return False
+        if not os.path.isdir(image_dir):
+            return True  # no source images, consider done
+        n_images = len([f for f in os.listdir(image_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))])
+        return n_depth >= n_images
+
+    # Step 3: lidar_pro/sequences/XX/*.bin
+    lidar_pro_root = os.path.join(vox_out_root, "lidar_pro", "sequences")
+    def lidar_pro_done():
+        for seq in sequences:
+            d = os.path.join(lidar_pro_root, seq)
+            if not os.path.isdir(d) or not any(f.endswith(".bin") for f in os.listdir(d)):
+                return False
+        return True
+
+    # Step 4: lidar_pro_labeled/labels/XX/*.label
+    lidar_labeled_root = os.path.join(vox_out_root, "lidar_pro_labeled", "labels")
+    def lidar_labeled_done():
+        for seq in sequences:
+            d = os.path.join(lidar_labeled_root, seq)
+            if not os.path.isdir(d) or not any(f.endswith(".label") for f in os.listdir(d)):
+                return False
+        return True
+
     print("=== 1) VoxFormerDepthPro: label preprocessing (voxels) ===")
-    run(
-        ["python", "VoxFormerDepthPro/scripts/1_prepare_labels.py"],
-        cwd=repo_root,
-    )
+    if preprocess_done():
+        print("(skip: preprocess/labels/00..10 already present)")
+    else:
+        run(
+            ["python", "VoxFormerDepthPro/scripts/1_prepare_labels.py"],
+            cwd=repo_root,
+        )
 
     print("\n=== 2) VoxFormerDepthPro: Depth Pro on RGB (per sequence) ===")
+    script_2 = os.path.join(repo_root, "VoxFormerDepthPro", "scripts", "2_run_depth_pro.py")
     for seq in sequences:
+        if depth_done_for(seq):
+            print(f"(skip seq {seq}: depth already present)")
+            continue
         run(
             [
-                "python",
-                "VoxFormerDepthPro/scripts/2_run_depth_pro.py",
+                sys.executable,
+                script_2,
                 "--seq",
                 seq,
                 "--device",
                 "cuda",
             ],
-            cwd=repo_root,
+            cwd=depth_pro_root,  # so depth_pro finds ./checkpoints/depth_pro.pt
         )
 
     print("\n=== 3) VoxFormerDepthPro: depth -> point clouds (.bin) ===")
+    # Always run step 3: script 3_depth_to_pointcloud.py skips per-seq when n_bin >= n_depth.
+    # So after re-running step 2 only for 00/01, step 3 will regenerate 00/01 and skip 02-10.
     run(
         [
             "python",
@@ -70,6 +134,7 @@ def main():
     )
 
     print("\n=== 4) VoxFormerDepthPro: assign labels from voxels ===")
+    # Always run step 4: script skips or overwrites per sequence; needed after step 3 updated 00/01.
     run(
         [
             "python",

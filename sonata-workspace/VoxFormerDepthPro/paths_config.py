@@ -1,36 +1,39 @@
 """
-Default paths for VoxFormerDepthPro so you don't have to type them every run.
-Override any path via script arguments.
+Default paths for VoxFormerDepthPro. Use env dataset and OUT to override (e.g. dataset=/workspace/dataset).
+KITTI = $dataset/SemanticKITTI, outputs = $OUT/VoxFormerDepthPro.
 """
 import os
 
-# Workspace dataset root (SemanticKITTI extracted here)
-WORKSPACE_DATASET = os.path.expanduser("~/Simon_ws/dataset")
-
-# SemanticKITTI root: contains dataset/sequences/XX/{image_2,velodyne,labels,voxels}, dataset/poses/
+# Dataset root: env "dataset" or default ~/Simon_ws/dataset
+WORKSPACE_DATASET = os.environ.get("dataset") or os.path.expanduser("~/Simon_ws/dataset")
+# SemanticKITTI root (KITTI = $dataset/SemanticKITTI)
 DEFAULT_KITTI_ROOT = os.path.join(WORKSPACE_DATASET, "SemanticKITTI")
-
-# Dataset folder inside KITTI root (has sequences/ and poses/)
 DATASET_SUBDIR = "dataset"
 
-# VoxFormerDepthPro outputs (separate from Sonata GT)
-DEFAULT_VOXFORMER_OUT = os.path.join(WORKSPACE_DATASET, "VoxFormerDepthPro_out")
+# Output root: env "OUT" or same as dataset root. VoxFormerDepthPro out = $OUT/VoxFormerDepthPro
+OUT_ROOT = os.environ.get("OUT") or WORKSPACE_DATASET
+DEFAULT_VOXFORMER_OUT = os.path.join(OUT_ROOT, "VoxFormerDepthPro")
 
-# Derived: dataset root for calib, sequences path for map_from_scans
+
 def get_dataset_root():
     return os.path.join(DEFAULT_KITTI_ROOT, DATASET_SUBDIR)
+
 
 def get_sequences_path():
     return os.path.join(get_dataset_root(), "sequences")
 
+
 def get_preprocess_root():
     return os.path.join(DEFAULT_VOXFORMER_OUT, "preprocess")
+
 
 def get_depth_root():
     return os.path.join(DEFAULT_VOXFORMER_OUT, "depth")
 
+
 def get_lidar_pro_root():
     return os.path.join(DEFAULT_VOXFORMER_OUT, "lidar_pro")
+
 
 def get_lidar_pro_labeled_root():
     return os.path.join(DEFAULT_VOXFORMER_OUT, "lidar_pro_labeled")

@@ -122,6 +122,8 @@ class SemanticKITTI(Dataset):
             self.pose_files = [self.pose_files[i] for i in valid]
             if self.use_ground_truth_maps:
                 self.gt_map_files = [self.gt_map_files[i] for i in valid]
+                if hasattr(self, "pose_index_in_seq"):
+                    self.pose_index_in_seq = [self.pose_index_in_seq[i] for i in valid]
             self.precomputed_files = [self.precomputed_files[i] for i in valid]
         
         print(f"Loaded SemanticKITTI {split} split:")
@@ -141,7 +143,7 @@ class SemanticKITTI(Dataset):
             
             scan_files = sorted(os.listdir(scan_dir))
             
-            for scan_file in scan_files:
+            for i, scan_file in enumerate(scan_files):
                 if not scan_file.endswith('.bin'):
                     continue
                 
@@ -160,6 +162,9 @@ class SemanticKITTI(Dataset):
                         self.root, 'ground_truth', seq, f'{scan_id}.npz'
                     )
                     self.gt_map_files.append(gt_map_path)
+                    if not hasattr(self, "pose_index_in_seq"):
+                        self.pose_index_in_seq = []
+                    self.pose_index_in_seq.append(i)
                 
                 if not hasattr(self, "precomputed_files"):
                     self.precomputed_files = []
@@ -218,11 +223,14 @@ class SemanticKITTI(Dataset):
             labels = np.zeros(scan.shape[0], dtype=np.int32)
         
         # Load or generate ground truth
-        if self.use_ground_truth_maps and \
-           os.path.exists(self.gt_map_files[idx]):
-            gt_complete = self._load_gt_map(self.gt_map_files[idx])
+        if self.use_ground_truth_maps:
+            if os.path.exists(self.gt_map_files[idx]):
+                gt_complete = self._load_gt_map(self.gt_map_files[idx])
+            else:
+                gt_complete = self._load_gt_map_from_map_world(idx)
+                if gt_complete is None:
+                    gt_complete = scan.copy()
         else:
-            # Use scan itself as GT for testing
             gt_complete = scan.copy()
         
         # Subsample scan if needed
@@ -312,6 +320,75 @@ class SemanticKITTI(Dataset):
         """Load pre-generated ground truth complete map."""
         data = np.load(gt_path)
         return data['points']
+
+    def _load_poses_cached(self, pose_path: str, calib_path: str) -> np.ndarray:
+        """Load poses (list of 4x4) with optional calib; cache by path."""
+        if not hasattr(self, "_poses_cache"):
+            self._poses_cache = {}
+        key = pose_path
+        if key not in self._poses_cache:
+            poses = []
+            with open(pose_path) as f:
+                for line in f:
+                    values = [float(v) for v in line.strip().split()]
+                    if len(values) < 12:
+                        continue
+                    pose = np.eye(4)
+                    pose[0, :4] = values[0:4]
+                    pose[1, :4] = values[4:8]
+                    pose[2, :4] = values[8:12]
+                    if os.path.exists(calib_path):
+                        calib = self._parse_calib(calib_path)
+                        if calib is not None and "Tr" in calib:
+                            pose = np.linalg.inv(calib["Tr"]) @ pose @ calib["Tr"]
+                    poses.append(pose)
+            self._poses_cache[key] = np.array(poses) if poses else np.zeros((0, 4, 4))
+        return self._poses_cache[key]
+
+    def _parse_calib(self, calib_path: str) -> Optional[dict]:
+        """Parse KITTI calib file; return dict with 'Tr' 4x4 if present."""
+        out = {}
+        with open(calib_path) as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                key, rest = line.strip().split(":", 1)
+                vals = [float(x) for x in rest.split()]
+                if len(vals) >= 12:
+                    M = np.eye(4)
+                    M[0, :4] = vals[0:4]
+                    M[1, :4] = vals[4:8]
+                    M[2, :4] = vals[8:12]
+                    out[key.strip()] = M
+        return out if out else None
+
+    def _load_gt_map_from_map_world(self, idx: int) -> Optional[np.ndarray]:
+        """Load GT by transforming map_world.npz to scan frame (saves ~hundreds GB vs per-scan npz)."""
+        gt_path = self.gt_map_files[idx]
+        seq_dir = os.path.dirname(gt_path)
+        map_world_path = os.path.join(seq_dir, "map_world.npz")
+        if not os.path.exists(map_world_path):
+            return None
+        if not hasattr(self, "pose_index_in_seq") or idx >= len(self.pose_index_in_seq):
+            return None
+        if not hasattr(self, "_map_world_cache"):
+            self._map_world_cache = {}
+        if seq_dir not in self._map_world_cache:
+            data = np.load(map_world_path)
+            self._map_world_cache[seq_dir] = data["points"].astype(np.float32)
+        points_world = self._map_world_cache[seq_dir]
+        pose_path = self.pose_files[idx]
+        seq_path = os.path.dirname(pose_path)
+        calib_path = os.path.join(seq_path, "calib.txt")
+        poses = self._load_poses_cached(pose_path, calib_path)
+        pi = self.pose_index_in_seq[idx]
+        if pi >= len(poses):
+            return None
+        pose_inv = np.linalg.inv(poses[pi])
+        ones = np.ones((points_world.shape[0], 1), dtype=np.float32)
+        pts = np.hstack([points_world, ones])
+        pts_scan = (pose_inv @ pts.T).T[:, :3]
+        return pts_scan.astype(np.float32)
     
     def _subsample_scan(
         self,

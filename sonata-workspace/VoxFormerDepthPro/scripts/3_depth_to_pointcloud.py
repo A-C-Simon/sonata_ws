@@ -14,7 +14,7 @@ from paths_config import get_dataset_root, get_depth_root, get_lidar_pro_root
 
 
 def run_sequences(depth_root, calib_root, save_root, sequences=None, max_depth=80.0):
-    """Process multiple sequences."""
+    """Process multiple sequences. Skips seq that already have .bin (resume after failure)."""
     if sequences is None:
         sequences = ["%02d" % i for i in range(22)]
     for seq in sequences:
@@ -23,6 +23,13 @@ def run_sequences(depth_root, calib_root, save_root, sequences=None, max_depth=8
         save_dir = os.path.join(save_root, "sequences", seq)
         if not os.path.isdir(depth_dir) or not os.path.isdir(calib_dir):
             continue
+        # Skip if this seq already has .bin (e.g. after re-run following step 3 failure)
+        if os.path.isdir(save_dir) and any(f.endswith(".bin") for f in os.listdir(save_dir)):
+            n_depth = len([f for f in os.listdir(depth_dir) if f.endswith(".npy") and "std" not in f])
+            n_bin = len([f for f in os.listdir(save_dir) if f.endswith(".bin")])
+            if n_bin >= n_depth:
+                print("Seq %s: skip (already %d .bin)" % (seq, n_bin))
+                continue
         n = process_sequence(depth_dir, calib_dir, save_dir, max_depth=max_depth)
         print("Seq %s: %d clouds" % (seq, n))
 

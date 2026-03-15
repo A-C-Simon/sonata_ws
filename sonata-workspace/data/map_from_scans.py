@@ -137,6 +137,7 @@ def generate_sequence_map(
     voxel_size: float = 0.1,
     sequences: list = None,
     backend: str = "numpy",
+    save_only_map_world: bool = False,
 ) -> None:
     """
     Generate ground truth maps for a sequence.
@@ -156,6 +157,7 @@ def generate_sequence_map(
     }  # moving-car, moving-person, etc.
 
     for seq in sequences:
+        print(f"\n>>> Processing sequence {seq} ...")
         seq_folder = os.path.join(seq_path, seq)
         velodyne_dir = os.path.join(seq_folder, "velodyne")
         labels_dir = os.path.join(seq_folder, "labels")
@@ -227,8 +229,12 @@ def generate_sequence_map(
             points=map_voxel.astype(np.float32),
         )
 
+        if save_only_map_world:
+            print(f"Saved map_world only for sequence {seq} (~{map_voxel.nbytes / 1e9:.2f} GB). Use dataset with use_map_world_fallback=True to load at train time.")
+            continue
+
         # For each scan, save map in scan frame (aligns with partial input)
-        for i, (pose, scan_file) in enumerate(zip(poses, scan_files)):
+        for i, (pose, scan_file) in enumerate(tqdm(zip(poses, scan_files), total=len(scan_files), desc=f"Save {seq}", unit="scan")):
             if i >= len(poses):
                 break
             pose_inv = np.linalg.inv(poses[i])
@@ -288,6 +294,11 @@ def main():
         default="numpy",
         help="Voxelization backend: numpy (default), open3d (faster CPU), torch (GPU)",
     )
+    parser.add_argument(
+        "--save_only_map_world",
+        action="store_true",
+        help="Save only map_world.npz per sequence (~600MB/seq). Skip per-scan .npz to save hundreds of GB.",
+    )
 
     args = parser.parse_args()
 
@@ -313,6 +324,7 @@ def main():
         voxel_size=args.voxel_size,
         sequences=sequences,
         backend=args.backend,
+        save_only_map_world=getattr(args, "save_only_map_world", False),
     )
 
     print(f"\nDone. Ground truth saved to {output_dir}/ground_truth/")
