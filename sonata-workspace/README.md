@@ -74,9 +74,10 @@ conda activate sonata_lidiff
 
 Runs:
 
-1. Generate ground truth maps from **LiDAR** (`map_from_scans.py`, GPU voxelization via PyTorch).
-2. Train **Sonata-LiDiff diffusion** on this LiDAR dataset.
-3. Train **refinement network** on the same data.
+1. Generate ground truth maps from **LiDAR** (`map_from_scans.py` with `--save_only_map_world` → one `map_world.npz` per seq).
+2. **Plan B:** Precompute voxelized cache (`precompute_voxelized_dataset.py`) → one `.npz` per frame in `voxelized_cache/` for fast training.
+3. Train **Sonata-LiDiff diffusion** with `--voxelized_cache_dir` (reads cache, no on-the-fly voxelization).
+4. Train **refinement network** on the same data.
 
 Command:
 
@@ -84,11 +85,19 @@ Command:
 python scripts/run_lidar_to_sonata.py
 ```
 
+To run only the voxelized cache pipeline (map + precompute), then train manually:
+
+```bash
+python scripts/run_voxelized_cache_semantickitti.py --data_path /path/to/SemanticKITTI/dataset
+# If map_world already exists: add --skip_map
+# Then run the printed train_diffusion.py command with --voxelized_cache_dir
+```
+
 Outputs:
 
 - Checkpoints: `checkpoints/diffusion_lidar`, `checkpoints/refinement_lidar`
 - Logs: `logs/diffusion_lidar`, `logs/refinement_lidar`
-- GT maps: `~/Simon_ws/dataset/SemanticKITTI/dataset/ground_truth/XX/*.npz`
+- GT: `ground_truth/XX/map_world.npz`; voxelized cache: `voxelized_cache/XX/{scan_id}.npz`
 
 ### 3.2 RGB → Depth Pro → Sonata (VoxFormerDepthPro + Sonata)
 
@@ -139,7 +148,7 @@ See `VoxFormerDepthPro/README.md` and `VoxFormerDepthPro/DATASET_AND_RUN.md` for
 
 ### 4.2 Ground truth generation (`map_from_scans.py`)
 
-Generates complete scene maps from sequential scans:
+Generates complete scene maps from sequential scans. For **plan B (voxelized cache)** use `--save_only_map_world` so that one `map_world.npz` per sequence is written (needed by `precompute_voxelized_dataset.py`):
 
 ```bash
 python data/map_from_scans.py \
@@ -147,11 +156,26 @@ python data/map_from_scans.py \
   --output ~/Simon_ws/dataset/SemanticKITTI/dataset \
   --voxel_size 0.1 \
   --backend torch \
+  --save_only_map_world \
   --sequences 00 01 02 03 04 05 06 07 08 09 10
 ```
 
 - Uses **GPU** if available when `--backend torch`.
 - Filters moving-object labels (252–259) when labels are present.
+
+### 4.2.1 Voxelized cache (plan B, faster training)
+
+After `map_from_scans` with `--save_only_map_world`, build the cache and train with it:
+
+```bash
+python data/precompute_voxelized_dataset.py \
+  --data_path /path/to/SemanticKITTI/dataset \
+  --output_dir /path/to/SemanticKITTI/dataset/voxelized_cache \
+  --voxel_size 0.05 \
+  --sequences 00 01 02 03 04 05 06 07 09 10
+```
+
+Then pass `--voxelized_cache_dir /path/to/SemanticKITTI/dataset/voxelized_cache` to `train_diffusion.py`. See `docs/VOXELIZED_CACHE_PIPELINE.md` and `docs/LIDAR_BASELINE_VOXELIZATION.md`.
 
 ### 4.3 Training scripts
 

@@ -50,6 +50,10 @@ def parse_args():
         '--voxel_size', type=float, default=0.05,
         help='Voxel size for scene representation'
     )
+    parser.add_argument(
+        '--voxelized_cache_dir', type=str, default=None,
+        help='Path to pre-voxelized cache (from precompute_voxelized_dataset.py); speeds up training'
+    )
 
     # Model
     parser.add_argument(
@@ -422,6 +426,7 @@ def main():
         use_ground_truth_maps=True,
         augmentation=not use_precomputed,
         use_precomputed=use_precomputed,
+        voxelized_cache_dir=getattr(args, 'voxelized_cache_dir', None),
     )
 
     val_dataset = SemanticKITTI(
@@ -431,6 +436,7 @@ def main():
         use_ground_truth_maps=True,
         augmentation=False,
         use_precomputed=use_precomputed,
+        voxelized_cache_dir=getattr(args, 'voxelized_cache_dir', None),
     )
 
     # Data loaders

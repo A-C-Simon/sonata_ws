@@ -79,10 +79,11 @@ class SemanticKITTI(Dataset):
         augmentation: bool = True,
         num_points_per_scan: Optional[int] = None,
         use_precomputed: bool = False,
+        voxelized_cache_dir: Optional[str] = None,
     ):
         """
         Initialize SemanticKITTI dataset.
-        
+
         Args:
             root: Path to SemanticKITTI dataset root
             split: Dataset split ('train', 'val', 'test')
@@ -91,9 +92,11 @@ class SemanticKITTI(Dataset):
             use_ground_truth_maps: Use pre-generated complete maps as GT
             augmentation: Apply data augmentation
             num_points_per_scan: Subsample scans to this number
+            use_precomputed: Use precomputed_v2 (encoder features) if available
+            voxelized_cache_dir: If set, load pre-voxelized npz per frame (from precompute_voxelized_dataset.py)
         """
         super().__init__()
-        
+
         self.root = root
         self.split = split
         self.voxel_size = voxel_size
@@ -102,16 +105,18 @@ class SemanticKITTI(Dataset):
         self.augmentation = augmentation
         self.num_points_per_scan = num_points_per_scan
         self.use_precomputed = use_precomputed
-        
+        self.voxelized_cache_dir = voxelized_cache_dir
+
         # Get sequences for this split
         self.sequences = self.SPLITS[split]
-        
+
         # Build file lists
         self.scan_files = []
         self.label_files = []
         self.pose_files = []
         self.gt_map_files = []
-        
+        self.voxelized_cache_files = []
+
         self._build_file_lists()
 
         # Filter to only samples with existing precomputed features
@@ -125,6 +130,7 @@ class SemanticKITTI(Dataset):
                 if hasattr(self, "pose_index_in_seq"):
                     self.pose_index_in_seq = [self.pose_index_in_seq[i] for i in valid]
             self.precomputed_files = [self.precomputed_files[i] for i in valid]
+            self.voxelized_cache_files = [self.voxelized_cache_files[i] for i in valid]
         
         print(f"Loaded SemanticKITTI {split} split:")
         print(f"  Sequences: {self.sequences}")
@@ -173,6 +179,14 @@ class SemanticKITTI(Dataset):
                 )
                 self.precomputed_files.append(precomp_path)
 
+                if self.voxelized_cache_dir:
+                    cache_path = os.path.join(
+                        self.voxelized_cache_dir, seq, f"{scan_id}.npz"
+                    )
+                else:
+                    cache_path = ""
+                self.voxelized_cache_files.append(cache_path)
+
                 self.scan_files.append(scan_path)
                 self.label_files.append(label_path)
                 self.pose_files.append(pose_path)
@@ -210,6 +224,31 @@ class SemanticKITTI(Dataset):
                     "complete_labels": torch.from_numpy(cl),
                     "scan_center": torch.from_numpy(sc),
                     "condition_features": torch.from_numpy(cf.copy()),
+                    "idx": idx,
+                }
+
+        # Fast path: load pre-voxelized cache (from precompute_voxelized_dataset.py)
+        if self.voxelized_cache_dir and idx < len(self.voxelized_cache_files):
+            cache_path = self.voxelized_cache_files[idx]
+            if cache_path and os.path.exists(cache_path):
+                data_npz = np.load(cache_path)
+                pc = data_npz["partial_coord"].astype(np.float32)
+                cc = data_npz["complete_coord"].astype(np.float32)
+                pl = data_npz["partial_labels"].astype(np.int64)
+                cl = data_npz["complete_labels"].astype(np.int64)
+                sc = data_npz["scan_center"].astype(np.float32)
+                if self.augmentation and self.split == "train":
+                    pc, cc, pl = self._augment(pc, cc, pl)
+                return {
+                    "partial_coord": torch.from_numpy(pc),
+                    "partial_color": torch.from_numpy(data_npz["partial_color"].astype(np.float32)),
+                    "partial_normal": torch.from_numpy(data_npz["partial_normal"].astype(np.float32)),
+                    "partial_labels": torch.from_numpy(pl),
+                    "complete_coord": torch.from_numpy(cc),
+                    "complete_color": torch.from_numpy(data_npz["complete_color"].astype(np.float32)),
+                    "complete_normal": torch.from_numpy(data_npz["complete_normal"].astype(np.float32)),
+                    "complete_labels": torch.from_numpy(cl),
+                    "scan_center": torch.from_numpy(sc),
                     "idx": idx,
                 }
 

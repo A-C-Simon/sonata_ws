@@ -42,6 +42,25 @@ def main():
             "0.1",
             "--backend",
             "torch",
+            "--save_only_map_world",
+            "--sequences",
+            *sequences,
+        ],
+        cwd=repo_root,
+    )
+
+    voxelized_cache = os.path.join(kitti_dataset_root, "voxelized_cache")
+    print("\n=== 1.5) Precompute voxelized cache (optional, speeds up training) ===")
+    run(
+        [
+            "python",
+            "data/precompute_voxelized_dataset.py",
+            "--data_path",
+            kitti_dataset_root,
+            "--output_dir",
+            voxelized_cache,
+            "--voxel_size",
+            "0.05",
             "--sequences",
             *sequences,
         ],
@@ -55,6 +74,8 @@ def main():
             "training/train_diffusion.py",
             "--data_path",
             kitti_dataset_root,
+            "--voxelized_cache_dir",
+            voxelized_cache,
             "--output_dir",
             "checkpoints/diffusion_lidar",
             "--log_dir",
