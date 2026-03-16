@@ -426,10 +426,9 @@ class PointwiseDiffusionBlock(nn.Module):
         # Apply time embedding (broadcast to all points)
         if time_embed.dim() == 1:
             time_embed = time_embed.unsqueeze(0)
-        time_feat = self.time_mlp(time_embed)  # (batch_size, in_channels)
-        # Assume single batch for now, expand to match features
-        if features.shape[0] > time_feat.shape[0]:
-            # Repeat time embedding for all points
+        time_feat = self.time_mlp(time_embed)
+        # Expand to per-point: already (N, dim) from batched call, or (batch_size, dim) for single batch
+        if time_feat.shape[0] != features.shape[0]:
             time_feat = time_feat.repeat(features.shape[0] // time_feat.shape[0] + 1, 1)[:features.shape[0]]
         x_feat = features + time_feat
         
@@ -560,7 +559,8 @@ class DenoisingNetwork(nn.Module):
         features: torch.Tensor,
         coords: torch.Tensor,
         timestep: torch.Tensor,
-        condition: Dict[str, torch.Tensor]
+        condition: Dict[str, torch.Tensor],
+        complete_batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Predict noise for denoising step.
@@ -570,25 +570,30 @@ class DenoisingNetwork(nn.Module):
             coords: (N, 3) point coordinates
             timestep: Current timestep (batch_size,)
             condition: Conditional features from Sonata encoder
+            complete_batch: (N,) batch index per point; if set, time embedding is expanded per point
             
         Returns:
             (N, in_channels) predicted noise
         """
-        # Time embedding
+        # Ensure float32 for all inputs (avoids Double/Float mismatch in linear layers)
+        features = features.float()
+        coords = coords.float()
+        cond_feat = condition['features'].float()
+        # Time embedding: (batch_size, dim) -> if batched, expand to (N, dim) per point
         t_embed = self.time_embedding(timestep)
-        
-        # Get conditional features
-        cond_feat = condition['features']
+        if complete_batch is not None:
+            t_embed = t_embed[complete_batch]
         
         # Input projection
         x = self.input_proj(features)
         x_coords = coords
         x_cond = cond_feat
         
-        # Encoder path
+        # Encoder path (keep t_embed in sync with downsampling for batched data)
         skip_features = []
         skip_coords = []
         skip_conds = []
+        skip_t_embeds = []
         
         for i, enc_block in enumerate(self.encoder_blocks):
             # Process with transformer at current level
@@ -598,6 +603,7 @@ class DenoisingNetwork(nn.Module):
             skip_features.append(x)
             skip_coords.append(x_coords)
             skip_conds.append(x_cond)
+            skip_t_embeds.append(t_embed)
 
             # Downsample and project to next level dimension
             target_num = x.shape[0] // 2
@@ -610,18 +616,20 @@ class DenoisingNetwork(nn.Module):
                 x = x[indices]
                 x_coords = x_coords[indices]
                 x_cond = x_cond[indices]
+                t_embed = t_embed[indices]
             # Project to next level dimension
             x = self.level_up[i](x)
 
         # Bottleneck
         x = self.bottleneck(x, x_coords, t_embed, x_cond)
         
-        # Decoder path
+        # Decoder path (use t_embed from skip at each level)
         for i, dec_block in enumerate(self.decoder_blocks):
             # Upsample to match skip connection
             skip_feat = skip_features[-(i+1)]
             skip_coord = skip_coords[-(i+1)]
             skip_cond = skip_conds[-(i+1)]
+            t_embed = skip_t_embeds[-(i+1)]
             
             x = self._upsample_points(x, x_coords, skip_coord)
             x_coords = skip_coord
@@ -658,10 +666,10 @@ class SinusoidalTimeEmbedding(nn.Module):
         """
         device = timesteps.device
         half_dim = self.embed_dim // 2
-        
-        embeddings = np.log(10000) / (half_dim - 1)
+        # Use torch for device placement (no numpy)
+        log_scale = torch.log(torch.tensor(10000.0, device=device)) / (half_dim - 1)
         embeddings = torch.exp(
-            torch.arange(half_dim, device=device) * -embeddings
+            torch.arange(half_dim, device=device, dtype=timesteps.dtype) * -log_scale
         )
         embeddings = timesteps[:, None] * embeddings[None, :]
         embeddings = torch.cat([
@@ -673,12 +681,44 @@ class SinusoidalTimeEmbedding(nn.Module):
 
 
 def knn_interpolate(features, source_coords, target_coords):
-    """Map features from source points to target points via nearest neighbor."""
+    """
+    Map features from source points to target points via nearest neighbor.
+    Uses GPU when tensors are on CUDA (avoids CPU sync); falls back to scipy cKDTree on CPU.
+    """
+    if source_coords.is_cuda and target_coords.is_cuda:
+        return _knn_interpolate_gpu(features, source_coords, target_coords)
     src_np = source_coords.detach().cpu().numpy()
     tgt_np = target_coords.detach().cpu().numpy()
     tree = cKDTree(src_np)
     _, indices = tree.query(tgt_np, k=1)
     indices = torch.from_numpy(indices.astype(np.int64)).to(features.device)
+    return features[indices]
+
+
+def _knn_interpolate_gpu(
+    features: torch.Tensor,
+    source_coords: torch.Tensor,
+    target_coords: torch.Tensor,
+    chunk_size: int = 512,
+) -> torch.Tensor:
+    """GPU-only KNN interpolate: for each target point, take feature from nearest source point.
+    Uses chunking to avoid OOM (cdist chunk_tgt x N_src). Use --batch_size 1 if still OOM.
+    """
+    source_coords = source_coords.float()
+    target_coords = target_coords.float()
+    N_src = source_coords.shape[0]
+    N_tgt = target_coords.shape[0]
+    if N_tgt <= chunk_size and N_tgt * N_src * 4 < 2 * (1024 ** 3):
+        # Single cdist only if small enough (~<2 GB)
+        dists = torch.cdist(target_coords, source_coords)
+        indices = dists.argmin(dim=-1)
+        return features[indices]
+    all_indices = []
+    for start in range(0, N_tgt, chunk_size):
+        end = min(start + chunk_size, N_tgt)
+        dists = torch.cdist(target_coords[start:end], source_coords)
+        all_indices.append(dists.argmin(dim=-1))
+    indices = torch.cat(all_indices, dim=0)
     return features[indices]
 
 
@@ -749,15 +789,18 @@ class SceneCompletionDiffusion(nn.Module):
         Returns:
             Dictionary with predictions and losses
         """
+        # Ensure float32 (dataset/numpy may provide float64)
+        complete_scan = complete_scan.float()
         if condition_features is not None:
             # Use pre-mapped condition features (from precomputed data)
-            cond_mapped = condition_features
+            cond_mapped = condition_features.float()
         else:
             # Extract conditional features and map to complete_scan coords
             cond_features, _ = self.condition_extractor(partial_scan)
             cond_mapped = knn_interpolate(
                 cond_features, partial_scan['coord'], complete_scan
             )
+            cond_mapped = cond_mapped.float()
         
         # Handle batched data
         if complete_batch is not None:
@@ -782,9 +825,10 @@ class SceneCompletionDiffusion(nn.Module):
         som = self.scheduler.sqrt_one_minus_alphas_cumprod.to(dev)[t_per_point].unsqueeze(-1)
         noisy_scan = sa * complete_scan + som * noise
 
-        # Predict noise using complete_scan coordinates
+        # Predict noise using complete_scan coordinates (pass complete_batch so time embedding is correct per sample)
         pred_noise = self.denoiser(
-            noisy_scan, complete_scan, t, {'features': cond_mapped}
+            noisy_scan, complete_scan, t, {'features': cond_mapped},
+            complete_batch=complete_batch
         )
 
         if return_loss:

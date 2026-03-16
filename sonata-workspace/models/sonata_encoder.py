@@ -138,7 +138,7 @@ class SonataEncoder(nn.Module):
                 - coords: Coordinates at each level
                 - point: Final encoded point cloud
         """
-        # Prepare input: construct feat from available keys
+        # Prepare input: construct feat from available keys (ensure float32 for encoder)
         import copy
         prepared = copy.copy(point_dict)
         if 'feat' not in prepared:
@@ -148,6 +148,11 @@ class SonataEncoder(nn.Module):
             if 'normal' in prepared:
                 feat_parts.append(prepared['normal'])
             prepared['feat'] = torch.cat(feat_parts, dim=-1)
+        prepared['feat'] = prepared['feat'].float()
+        if 'coord' in prepared:
+            prepared['coord'] = prepared['coord'].float()
+        if 'grid_coord' in prepared:
+            prepared['grid_coord'] = prepared['grid_coord'].float()
         if 'grid_size' not in prepared and 'grid_coord' not in prepared:
             prepared['grid_size'] = 0.02
 
