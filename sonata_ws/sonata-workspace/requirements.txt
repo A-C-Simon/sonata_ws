@@ -1,0 +1,25 @@
+# Core
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.21.0,<2.0
+scipy==1.11.4
+
+# Sparse convolution (Sonata encoder); use wheel matching your CUDA (cu118, cu121, cu124)
+spconv-cu124
+
+# Point cloud / vision
+open3d>=0.16.0
+huggingface_hub
+timm
+
+# Data & training
+pyyaml>=5.4.0
+h5py>=3.0.0
+tensorboard>=2.8.0
+tqdm>=4.60.0
+matplotlib>=3.3.0
+pillow>=8.0.0
+scikit-learn>=0.24.0
+psutil
+
+# Optional: flash-attn>=2.0.0  (install separately if needed)

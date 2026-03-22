@@ -5,3 +5,16 @@ env/
 .DS_Store
 *.log
 .ipynb_checkpoints
+
+.cursor-server/
+Simon_ws/
+dataset/
+*.ply
+*.npz
+**/*tfevents*
+sonata_ws/dataset/
+sonata_ws/sonata-workspace/checkpoints/
+sonata_ws/sonata-workspace/logs/
+sonata_ws/sonata-workspace/gt_maps_refined/
+sonata_ws/sonata-workspace/sonata/
+**/sonata_lidiff.egg-info/
