@@ -1,0 +1,28 @@
+# Sonata-LiDiff — conda env matching README_2.md (sonata_lidiff)
+#
+# From this repo root:
+#   conda env create -f environment.yml
+#   conda activate sonata_lidiff
+#   pip install -e .
+#
+# If the env already exists:
+#   conda env update -f environment.yml --prune
+#
+# CUDA: pytorch-cuda=12.4 matches requirements.txt (spconv-cu124).
+# For other GPUs / drivers, change the pytorch-cuda line (e.g. 12.1, 11.8).
+
+name: sonata_lidiff
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch>=2.0
+  - torchvision
+  - pytorch-cuda=12.4
+  - pip:
+    - -r requirements-pip-after-conda.txt

@@ -5,12 +5,189 @@ Implements the diffusion process for point cloud completion,
 following LiDiff's point-wise local approach with Sonata encoder conditioning.
 """
 
+import math
+from typing import Callable, Dict, Optional, Set, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, Tuple
-import numpy as np
-from scipy.spatial import cKDTree
+# Default shell size / scene bound (matches typical 20 m local KITTI crop in CLI scripts).
+DEFAULT_TRAIN_MAX_POINTS = 8000
+QUERY_MAX_RADIUS = 20.0
+# Horizontal distance from sensor below which we do NOT place synthetic queries (blind / unstable NN-GT).
+QUERY_MIN_RADIUS = 3.0
+# Stabilize diffusion: cap predicted ε to avoid rare MSE / pred_x0 blow-ups (training + sampling).
+PRED_NOISE_CLAMP = 10.0
+# Skip t∈[0,9): very low noise makes sqrt(ᾱ) tiny and x0-from-ε numerically unstable.
+TRAIN_TIMESTEP_MIN = 10
+
+
+def build_query_shell(
+    partial_coords: torch.Tensor,
+    num_query: int = 8000,
+    radius: float = 20.0,
+    min_radius: float = QUERY_MIN_RADIUS,
+    device: Optional[torch.device] = None,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """
+    Concatenate observed partial voxels with extra queries in a vertical cylinder.
+
+    Design (minimal change vs full redesign): keep **cylinder + uniform-style sampling** so
+    training and inference stay simple; avoid surface-aware query placement (harder, needs
+    extra modules). Extra queries use **r_xy in [min_radius, radius]** so nothing is sampled
+    inside the typical sensor blind / ego cylinder where LiDAR has no returns and NN GT is
+    inconsistent (artifact blob near origin).
+
+    We do **not** normalize coordinates here: Sonata and KNN conditioning expect metric
+    ``partial_scan['coord']``; normalizing only the diffusion branch would desync encodings
+    unless the encoder and all KNN trees were redesigned.
+
+    Coordinate diffusion scale (meters vs N(0,1) noise) is imperfect; fixing it would mean
+    global norm/denorm — skipped for safety; see module docstring / training notes.
+    """
+    if partial_coords.numel() == 0:
+        raise ValueError("build_query_shell: partial_coords is empty")
+    device = device or partial_coords.device
+    partial_coords = partial_coords.to(device=device, dtype=torch.float32)
+    R = float(radius)
+    r0 = float(min_radius)
+    if r0 >= R:
+        raise ValueError(f"build_query_shell: min_radius ({r0}) must be < radius ({R})")
+    u = torch.rand(num_query, 2, device=device, generator=generator, dtype=torch.float32)
+    # Spec: r = sqrt(u) * (R - r_min) + r_min  →  annulus excluding [0, r_min).
+    r_xy = torch.sqrt(u[:, 0].clamp(min=1e-8)) * (R - r0) + r0
+    theta = 2.0 * math.pi * u[:, 1]
+    xy = torch.stack([r_xy * torch.cos(theta), r_xy * torch.sin(theta)], dim=-1)
+    z = (torch.rand(num_query, device=device, generator=generator, dtype=torch.float32) * 2.0 - 1.0) * R
+    extra = torch.cat([xy, z.unsqueeze(-1)], dim=-1)
+    return torch.cat([partial_coords, extra], dim=0)
+
+
+def build_shell_coords_single(
+    partial_coords: torch.Tensor,
+    num_query_extra: int = DEFAULT_TRAIN_MAX_POINTS,
+    target_shell_total: Optional[int] = None,
+    max_radius: float = QUERY_MAX_RADIUS,
+    min_radius: float = QUERY_MIN_RADIUS,
+    query_voxel_size: float = 0.15,
+    rng: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    CPU-side shell for inference scripts. ``query_voxel_size`` is kept only for
+    backward-compatible CLI; queries are sampled continuously like training.
+    ``min_radius`` must match training (no queries inside sensor blind zone).
+    """
+    _ = query_voxel_size  # legacy API
+    t = partial_coords.detach().float().cpu()
+    g = torch.Generator(device="cpu")
+    if rng is not None:
+        g.manual_seed(int(rng))
+    n_q = int(num_query_extra)
+    if target_shell_total is not None:
+        n_q = max(0, int(target_shell_total) - int(t.shape[0]))
+    return build_query_shell(
+        t,
+        num_query=n_q,
+        radius=float(max_radius),
+        min_radius=float(min_radius),
+        device=torch.device("cpu"),
+        generator=g,
+    )
+
+
+def farthest_point_sample(coords: torch.Tensor, npoint: int) -> torch.Tensor:
+    """
+    FPS indices (N,) -> (npoint,) for coords (N, 3). Replaces uniform linewise
+    downsampling so coarser scales still cover the frustum / scene geometry.
+    """
+    N = coords.shape[0]
+    if N <= npoint:
+        return torch.arange(N, device=coords.device, dtype=torch.long)
+    device = coords.device
+    idx = torch.zeros(npoint, dtype=torch.long, device=device)
+    dist = torch.ones(N, device=device) * 1e10
+    farthest = torch.randint(0, N, (1,), device=device) % N
+    farthest = int(farthest.item())
+    c = coords.float()
+    for i in range(npoint):
+        idx[i] = farthest
+        cent = c[farthest : farthest + 1]
+        d = torch.sum((c - cent) ** 2, dim=-1)
+        dist = torch.minimum(dist, d)
+        farthest = int(torch.argmax(dist).item())
+    return idx
+
+
+def knn_interpolate_batched(
+    values: torch.Tensor,
+    source_coords: torch.Tensor,
+    target_coords: torch.Tensor,
+    source_batch: torch.Tensor,
+    target_batch: torch.Tensor,
+) -> torch.Tensor:
+    """Batched NN interpolate for concatenated sparse tensors with batch indices."""
+    out_list = []
+    B = int(target_batch.max().item()) + 1
+    for b in range(B):
+        sm = source_batch == b
+        tm = target_batch == b
+        out_list.append(
+            knn_interpolate(values[sm], source_coords[sm], target_coords[tm])
+        )
+    return torch.cat(out_list, dim=0)
+
+
+def build_query_shell_batched(
+    partial_coord: torch.Tensor,
+    partial_batch: torch.Tensor,
+    num_query: int,
+    radius: float,
+    min_radius: float = QUERY_MIN_RADIUS,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """One cylinder shell per batch item; returns (coords, batch_tensor)."""
+    chunks = []
+    batches = []
+    B = int(partial_batch.max().item()) + 1
+    for b in range(B):
+        mask = partial_batch == b
+        pc = partial_coord[mask]
+        shell = build_query_shell(
+            pc,
+            num_query=num_query,
+            radius=radius,
+            min_radius=min_radius,
+            device=partial_coord.device,
+            generator=generator,
+        )
+        n = shell.shape[0]
+        chunks.append(shell)
+        batches.append(
+            torch.full((n,), b, device=partial_coord.device, dtype=torch.long)
+        )
+    return torch.cat(chunks, dim=0), torch.cat(batches, dim=0)
+
+
+def chamfer_symmetric_torch(
+    pcd1: torch.Tensor,
+    pcd2: torch.Tensor,
+    max_points: int = 4096,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Symmetric squared Chamfer on point sets (subsampling for memory). Same spirit as eval scripts."""
+    p1, p2 = pcd1.float(), pcd2.float()
+    if p1.shape[0] > max_points:
+        perm = torch.randperm(p1.shape[0], device=p1.device, generator=generator)[:max_points]
+        p1 = p1[perm]
+    if p2.shape[0] > max_points:
+        perm = torch.randperm(p2.shape[0], device=p2.device, generator=generator)[:max_points]
+        p2 = p2[perm]
+    d = torch.cdist(p1, p2)
+    c1 = d.min(dim=1)[0].pow(2).mean()
+    c2 = d.min(dim=0)[0].pow(2).mean()
+    return 0.5 * (c1 + c2)
 
 
 class DiffusionScheduler:
@@ -124,6 +301,19 @@ class DiffusionScheduler:
             sqrt_one_minus_alphas_cumprod_t * noise
         )
     
+    def _to_device(self, device):
+        """Move scheduler tensors to device."""
+        self.betas = self.betas.to(device)
+        self.alphas = self.alphas.to(device)
+        self.alphas_cumprod = self.alphas_cumprod.to(device)
+        self.alphas_cumprod_prev = self.alphas_cumprod_prev.to(device)
+        self.sqrt_alphas_cumprod = self.sqrt_alphas_cumprod.to(device)
+        self.sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device)
+        self.sqrt_recip_alphas = self.sqrt_recip_alphas.to(device)
+        self.sqrt_recipm1_alphas = self.sqrt_recipm1_alphas.to(device)
+        self.posterior_variance = self.posterior_variance.to(device)
+        self.posterior_log_variance_clipped = self.posterior_log_variance_clipped.to(device)
+
     def p_sample_step(
         self,
         model: nn.Module,
@@ -131,56 +321,43 @@ class DiffusionScheduler:
         x_t_coords: torch.Tensor,
         t: int,
         condition: Dict[str, torch.Tensor],
-        clip_denoised: bool = True
+        clip_denoised: bool = False
     ) -> torch.Tensor:
         """
-        Single step of reverse diffusion: p(x_{t-1} | x_t)
-        
-        Args:
-            model: Denoising model
-            x_t_features: (N, 3) Noisy features at timestep t
-            x_t_coords: (N, 3) Point coordinates
-            t: Current timestep
-            condition: Conditional information
-            clip_denoised: Clip denoised output
-            
-        Returns:
-            (N, 3) Denoised features at timestep t-1
+        Single step of reverse diffusion: p(x_{t-1} | x_t).
+        Must be called with consecutive timesteps (t, t-1, ..., 0).
         """
+        device = x_t_features.device
+        self._to_device(device)
+
+        # One shared timestep for all points; shape (N,) so time MLP matches point count in batch.
         N = x_t_features.shape[0]
-        t_per_point = torch.full((N,), t, device=x_t_features.device, dtype=torch.long)
+        t_tensor = torch.full((N,), int(t), device=device, dtype=torch.long)
+        pred_noise = model(x_t_features, x_t_coords, t_tensor, condition)
+        pred_noise = torch.clamp(pred_noise, -PRED_NOISE_CLAMP, PRED_NOISE_CLAMP)
 
-        # Model predicts residual delta; x0 = x_t + delta (more stable)
-        pred_delta = model(x_t_features, x_t_coords, t_per_point, condition)
-        pred_x0 = x_t_features + pred_delta
-
-        alpha_t = self.alphas_cumprod[t]
-        alpha_t_prev = self.alphas_cumprod_prev[t]
+        # Predict x_0
+        alpha_bar = self.alphas_cumprod[t]
+        alpha_bar_prev = self.alphas_cumprod_prev[t]
         beta_t = self.betas[t]
-        # Derive pred_noise for posterior (needed for DDPM step)
-        pred_noise = (
-            x_t_features - self.sqrt_alphas_cumprod[t] * pred_x0
-        ) / self.sqrt_one_minus_alphas_cumprod[t].clamp(min=1e-8)
-        
+
+        pred_x0 = (
+            x_t_features - self.sqrt_one_minus_alphas_cumprod[t] * pred_noise
+        ) / self.sqrt_alphas_cumprod[t]
+
         if clip_denoised:
-            pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
-        
-        # Compute x_{t-1}
+            pred_x0 = torch.clamp(pred_x0, -50.0, 50.0)
+
         if t > 0:
-            noise = torch.randn_like(x_t_features)
-            posterior_variance_t = self.posterior_variance[t]
-            
-            # x_{t-1} = posterior_mean + sqrt(posterior_variance) * noise
+            posterior_var = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar)
             posterior_mean = (
-                self.sqrt_alphas_cumprod[t - 1] * pred_x0 +
-                torch.sqrt(1 - alpha_t_prev - posterior_variance_t) * pred_noise
+                torch.sqrt(alpha_bar_prev) * beta_t / (1.0 - alpha_bar) * pred_x0
+                + torch.sqrt(self.alphas[t]) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar) * x_t_features
             )
-            
-            x_t_prev = posterior_mean + torch.sqrt(posterior_variance_t) * noise
+            noise = torch.randn_like(x_t_features)
+            return posterior_mean + torch.sqrt(posterior_var) * noise
         else:
-            x_t_prev = pred_x0
-        
-        return x_t_prev
+            return pred_x0
 
 
 class SonataTransformerBlock(nn.Module):
@@ -301,20 +478,15 @@ class SonataTransformerBlock(nn.Module):
         return out
     
     def _find_neighbors(self, coords: torch.Tensor) -> torch.Tensor:
-        """KNN using matmul (||a-b||^2 = ||a||^2 + ||b||^2 - 2a·b) to avoid large cdist."""
+        """Find k-nearest neighbors for each point using GPU."""
         N = coords.shape[0]
         k = min(self.num_neighbors + 1, N)
-        if k <= 1:
-            return torch.zeros(N, self.num_neighbors, dtype=torch.long, device=coords.device)
-        sq = (coords ** 2).sum(dim=1)
         chunk_size = 4096
         all_indices = []
         for start in range(0, N, chunk_size):
             end = min(start + chunk_size, N)
-            chunk = coords[start:end]
-            dist_sq = sq[start:end].unsqueeze(1) + sq.unsqueeze(0) - 2 * (chunk @ coords.T)
-            dist_sq = dist_sq.clamp(min=0)
-            _, idx = dist_sq.topk(k, dim=-1, largest=False)
+            dists = torch.cdist(coords[start:end].unsqueeze(0), coords.unsqueeze(0)).squeeze(0)
+            _, idx = dists.topk(k, dim=-1, largest=False)
             all_indices.append(idx[:, 1:])
         result = torch.cat(all_indices, dim=0)
         if result.shape[1] < self.num_neighbors:
@@ -366,6 +538,8 @@ class PointwiseDiffusionBlock(nn.Module):
         num_neighbors: int = 16,
         num_heads: int = 8,
         num_groups: int = 4,
+        conditioning_mode: str = "concat",
+        conditioning_scale: float = 1.0,
     ):
         """
         Initialize point-wise diffusion block.
@@ -377,10 +551,17 @@ class PointwiseDiffusionBlock(nn.Module):
             num_neighbors: Number of neighbors for local processing
             num_heads: Number of attention heads
             num_groups: Number of groups for grouped vector attention
+            conditioning_mode: How to fuse encoder features (concat | additive | film).
+            conditioning_scale: Strength for additive / FiLM paths (concat ignores scale).
         """
         super().__init__()
         
         self.num_neighbors = num_neighbors
+        mode = str(conditioning_mode).lower()
+        if mode not in ("concat", "additive", "film"):
+            raise ValueError(f"conditioning_mode must be concat|additive|film, got {conditioning_mode!r}")
+        self.conditioning_mode = mode
+        self.conditioning_scale = float(conditioning_scale)
         
         # Time embedding MLP
         self.time_mlp = nn.Sequential(
@@ -389,9 +570,10 @@ class PointwiseDiffusionBlock(nn.Module):
             nn.Linear(in_channels, in_channels)
         )
         
-        # Condition projection
+        # Condition projection + fusion: concat makes cond a hard bottleneck (additive cond was easy to ignore).
         self.condition_proj = nn.Linear(condition_dim, in_channels)
-        
+        self.cond_fuse = nn.Linear(in_channels * 2, in_channels)
+
         # Sonata-style transformer block
         self.transformer = SonataTransformerBlock(
             dim=in_channels,
@@ -416,25 +598,35 @@ class PointwiseDiffusionBlock(nn.Module):
     ) -> torch.Tensor:
         """
         Forward pass.
-
+        
         Args:
             features: (N, in_channels) point features
             coords: (N, 3) point coordinates
-            time_embed: (N, time_embed_dim) per-point time embedding
+            time_embed: (batch_size, time_embed_dim) time step embedding
             condition: (N, condition_dim) conditional features from encoder
             neighbors: (N, num_neighbors) neighbor indices (optional)
-
+            
         Returns:
             (N, out_channels) processed features
         """
-        # Per-point time embedding: (N, embed_dim) -> (N, in_channels)
+        # time_embed is (N, time_embed_dim): one diffusion time per point (batched scenes).
         time_feat = self.time_mlp(time_embed)
         x_feat = features + time_feat
-        
-        # Apply condition
+
         cond_feat = self.condition_proj(condition)
-        x_feat = x_feat + cond_feat
-        
+        cond_feat = torch.clamp(cond_feat, -10.0, 10.0)
+
+        if self.conditioning_mode == "concat":
+            x_feat = self.cond_fuse(torch.cat([x_feat, cond_feat], dim=-1))
+        elif self.conditioning_mode == "additive":
+            x_feat = x_feat + self.conditioning_scale * cond_feat
+        else:  # film
+            scale = torch.tanh(cond_feat)
+            x_feat = x_feat * (1.0 + self.conditioning_scale * scale)
+
+        if self.training and torch.rand(1).item() < 0.01:
+            print("Cond influence check:", cond_feat.abs().mean().item())
+
         # Transformer processing
         x_transformed = self.transformer(x_feat, coords, neighbors)
         
@@ -461,6 +653,8 @@ class DenoisingNetwork(nn.Module):
         hidden_dims: list = [64, 128, 256, 512],
         time_embed_dim: int = 128,
         num_neighbors: int = 16,
+        conditioning_mode: str = "concat",
+        conditioning_scale: float = 1.0,
     ):
         """
         Initialize denoising network.
@@ -471,11 +665,15 @@ class DenoisingNetwork(nn.Module):
             hidden_dims: Hidden dimensions for U-Net levels
             time_embed_dim: Time embedding dimension
             num_neighbors: Neighbors for local processing
+            conditioning_mode: Passed to each PointwiseDiffusionBlock (concat | additive | film).
+            conditioning_scale: Strength for additive / FiLM blocks.
         """
         super().__init__()
         
         self.time_embed_dim = time_embed_dim
         self.hidden_dims = hidden_dims
+        self.conditioning_mode = str(conditioning_mode).lower()
+        self.conditioning_scale = float(conditioning_scale)
         
         # Sinusoidal time embedding
         self.time_embedding = SinusoidalTimeEmbedding(time_embed_dim)
@@ -491,7 +689,9 @@ class DenoisingNetwork(nn.Module):
             self.encoder_blocks.append(
                 PointwiseDiffusionBlock(
                     hidden_dims[i], hidden_dims[i],
-                    time_embed_dim, condition_dim, num_neighbors
+                    time_embed_dim, condition_dim, num_neighbors,
+                    conditioning_mode=self.conditioning_mode,
+                    conditioning_scale=self.conditioning_scale,
                 )
             )
         
@@ -504,7 +704,9 @@ class DenoisingNetwork(nn.Module):
         # Bottleneck
         self.bottleneck = PointwiseDiffusionBlock(
             hidden_dims[-1], hidden_dims[-1],
-            time_embed_dim, condition_dim, num_neighbors
+            time_embed_dim, condition_dim, num_neighbors,
+            conditioning_mode=self.conditioning_mode,
+            conditioning_scale=self.conditioning_scale,
         )
         
         # Decoder blocks (upsampling)
@@ -515,42 +717,27 @@ class DenoisingNetwork(nn.Module):
             self.decoder_blocks.append(
                 PointwiseDiffusionBlock(
                     hidden_dims[i - 1] + hidden_dims[i], hidden_dims[i - 1],
-                    time_embed_dim, condition_dim, num_neighbors
+                    time_embed_dim, condition_dim, num_neighbors,
+                    conditioning_mode=self.conditioning_mode,
+                    conditioning_scale=self.conditioning_scale,
                 )
             )
         
         # Output projection (predict noise)
         self.output_proj = nn.Linear(hidden_dims[0], in_channels)
     
-    def _fps_indices(self, coords: torch.Tensor, target_num: int) -> torch.Tensor:
-        """Farthest Point Sampling: indices that preserve geometry."""
-        N = coords.shape[0]
-        if N <= target_num:
-            return torch.arange(N, device=coords.device, dtype=torch.long)
-        idx = torch.zeros(target_num, dtype=torch.long, device=coords.device)
-        idx[0] = torch.randint(0, N, (1,), device=coords.device).item()
-        dists = torch.full((N,), float("inf"), device=coords.device, dtype=coords.dtype)
-        chunk_sz = 4096
-        for i in range(1, target_num):
-            center = coords[idx[i - 1]]
-            for start in range(0, N, chunk_sz):
-                end = min(start + chunk_sz, N)
-                d = torch.sum((coords[start:end] - center) ** 2, dim=-1)
-                dists[start:end] = torch.minimum(dists[start:end], d)
-            idx[i] = dists.argmax().item()
-        return idx
-
     def _downsample_points(
         self,
         features: torch.Tensor,
         coords: torch.Tensor,
         target_num: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Downsample using FPS to preserve geometry."""
+        """Downsample points using farthest point sampling."""
         N = features.shape[0]
         if N <= target_num:
             return features, coords
-        indices = self._fps_indices(coords, target_num)
+
+        indices = farthest_point_sample(coords, target_num)
         return features[indices], coords[indices]
     
     def _upsample_points(
@@ -559,21 +746,14 @@ class DenoisingNetwork(nn.Module):
         coords: torch.Tensor,
         target_coords: torch.Tensor
     ) -> torch.Tensor:
-        """Upsample features via nearest neighbor (matmul-based KNN)."""
-        n_tgt = target_coords.shape[0]
-        n_src = coords.shape[0]
-        if n_src == 0:
-            return torch.zeros(n_tgt, features.shape[-1], device=features.device, dtype=features.dtype)
-        sq_src = (coords ** 2).sum(dim=1)
+        """Upsample features to target coordinates using GPU nearest neighbor."""
         chunk_size = 4096
-        all_idx = []
-        for start in range(0, n_tgt, chunk_size):
-            end = min(start + chunk_size, n_tgt)
-            tgt = target_coords[start:end]
-            sq_tgt = (tgt ** 2).sum(dim=1)
-            dist_sq = sq_tgt.unsqueeze(1) + sq_src.unsqueeze(0) - 2 * (tgt @ coords.T)
-            all_idx.append(dist_sq.argmin(dim=-1))
-        indices = torch.cat(all_idx, dim=0)
+        all_indices = []
+        for start in range(0, target_coords.shape[0], chunk_size):
+            end = min(start + chunk_size, target_coords.shape[0])
+            dists = torch.cdist(target_coords[start:end].unsqueeze(0), coords.unsqueeze(0)).squeeze(0)
+            all_indices.append(dists.argmin(dim=-1))
+        indices = torch.cat(all_indices, dim=0)
         return features[indices]
     
     def forward(
@@ -585,18 +765,18 @@ class DenoisingNetwork(nn.Module):
     ) -> torch.Tensor:
         """
         Predict noise for denoising step.
-
+        
         Args:
             features: (N, in_channels) noisy point features
             coords: (N, 3) point coordinates
-            timestep: (N,) per-point timesteps (no broadcast/repeat)
+            timestep: Current timestep (batch_size,)
             condition: Conditional features from Sonata encoder
-
+            
         Returns:
             (N, in_channels) predicted noise
         """
-        # Per-point time embedding: (N,) -> (N, embed_dim)
-        t_embed = self.time_embedding(timestep)
+        # Time embedding: expect one timestep per point (N,) for mixed batch sizes.
+        t_embed = self.time_embedding(timestep.reshape(-1).long())
         
         # Get conditional features
         cond_feat = condition['features']
@@ -606,41 +786,51 @@ class DenoisingNetwork(nn.Module):
         x_coords = coords
         x_cond = cond_feat
         
-        # Encoder path (downsample t_embed with coords)
+        # Encoder path
         skip_features = []
         skip_coords = []
         skip_conds = []
-
+        
         for i, enc_block in enumerate(self.encoder_blocks):
+            # Process with transformer at current level
             x = enc_block(x, x_coords, t_embed, x_cond)
+
+            # Save skip connection
             skip_features.append(x)
             skip_coords.append(x_coords)
             skip_conds.append(x_cond)
 
-            target_num = max(1, x.shape[0] // 2)
-            if x.shape[0] > target_num:
-                indices = self._fps_indices(x_coords, target_num)
+            # Downsample and project to next level dimension
+            target_num = x.shape[0] // 2
+            N = x.shape[0]
+            if N > target_num:
+                indices = farthest_point_sample(x_coords, target_num)
                 x = x[indices]
                 x_coords = x_coords[indices]
                 x_cond = x_cond[indices]
                 t_embed = t_embed[indices]
+            # Project to next level dimension
             x = self.level_up[i](x)
 
         # Bottleneck
         x = self.bottleneck(x, x_coords, t_embed, x_cond)
-
-        # Decoder path (upsample t_embed to match skip)
+        
+        # Decoder path
         for i, dec_block in enumerate(self.decoder_blocks):
+            # Upsample to match skip connection
             skip_feat = skip_features[-(i+1)]
             skip_coord = skip_coords[-(i+1)]
             skip_cond = skip_conds[-(i+1)]
-            t_embed = self._upsample_points(t_embed, x_coords, skip_coord)
-
+            
             x = self._upsample_points(x, x_coords, skip_coord)
+            t_embed = self._upsample_points(t_embed, x_coords, skip_coord)
             x_coords = skip_coord
             x_cond = skip_cond
 
+            # Concatenate skip connection
             x = torch.cat([x, skip_feat], dim=-1)
+
+            # Process with transformer
             x = dec_block(x, x_coords, t_embed, x_cond)
         
         # Output projection
@@ -650,269 +840,49 @@ class DenoisingNetwork(nn.Module):
 
 
 class SinusoidalTimeEmbedding(nn.Module):
-    """Sinusoidal time embedding for diffusion timesteps (per-point)."""
-
+    """Sinusoidal time embedding for diffusion timesteps."""
+    
     def __init__(self, embed_dim: int):
         super().__init__()
         self.embed_dim = embed_dim
-
+    
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
         """
         Create sinusoidal embeddings.
-
+        
         Args:
-            timesteps: (N,) per-point timestep values
-
+            timesteps: (batch_size,) timestep values
+            
         Returns:
-            (N, embed_dim) embeddings — one per point, no repeat
+            (batch_size, embed_dim) embeddings
         """
         device = timesteps.device
         half_dim = self.embed_dim // 2
-
+        
         embeddings = np.log(10000) / (half_dim - 1)
         embeddings = torch.exp(
-            torch.arange(half_dim, device=device, dtype=timesteps.dtype) * -embeddings
+            torch.arange(half_dim, device=device) * -embeddings
         )
-        # timesteps: (N,) -> (N, 1) * (1, half_dim) -> (N, half_dim)
-        emb = timesteps.float().unsqueeze(-1) * embeddings.unsqueeze(0)
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
-        return emb
+        embeddings = timesteps.float()[:, None] * embeddings[None, :]
+        embeddings = torch.cat([
+            torch.sin(embeddings), torch.cos(embeddings)
+        ], dim=-1)
+        
+        return embeddings
 
-
-
-def weighted_interpolate(
-    features: torch.Tensor,
-    source_coords: torch.Tensor,
-    target_coords: torch.Tensor,
-    k: int = 4,
-    eps: float = 1e-8,
-    chunk_size: int = 2048,
-) -> torch.Tensor:
-    """Map features from source to target via inverse-distance weighted interpolation."""
-    device = features.device
-    feat_dim = features.shape[-1]
-    n_target = target_coords.shape[0]
-    n_src = source_coords.shape[0]
-    k = min(k, n_src)
-    if k <= 0 or n_src == 0:
-        return torch.zeros(n_target, feat_dim, device=device, dtype=features.dtype)
-
-    out = []
-    for start in range(0, n_target, chunk_size):
-        end = min(start + chunk_size, n_target)
-        tgt = target_coords[start:end]
-        diff = tgt.unsqueeze(1) - source_coords.unsqueeze(0)
-        dist_sq = (diff ** 2).sum(-1).clamp(min=eps)
-        dist = dist_sq.sqrt()
-        weights, idx = torch.topk(-dist, k, dim=1)
-        weights = (-weights).clamp(min=eps)
-        weights = weights / (weights.sum(dim=1, keepdim=True) + eps)
-        gathered = features[idx]
-        interp = (weights.unsqueeze(-1) * gathered).sum(dim=1)
-        out.append(interp)
-    return torch.cat(out, dim=0)
 
 
 def knn_interpolate(features, source_coords, target_coords):
-    """Legacy alias; use weighted_interpolate for better quality."""
-    return weighted_interpolate(features, source_coords, target_coords, k=4)
-
-
-def chamfer_distance_training(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    chunk_size: int = 512,
-) -> torch.Tensor:
-    """
-    Symmetric mean squared Chamfer between two point clouds.
-    Chunked to avoid OOM on large N, M (same pattern as refinement_net).
-    """
-    def min_dist_sq_dir(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        mins = []
-        for i in range(0, a.shape[0], chunk_size):
-            chunk = a[i : i + chunk_size]
-            diff = chunk.unsqueeze(1) - b.unsqueeze(0)
-            dist = (diff ** 2).sum(-1)
-            mins.append(dist.min(1)[0])
-        return torch.cat(mins, dim=0)
-
-    min_p2t = min_dist_sq_dir(pred, target)
-    min_t2p = min_dist_sq_dir(target, pred)
-    return (min_p2t.mean() + min_t2p.mean()) / 2
-
-
-# Aligned with map_from_scans_boost: output_radius=20m, scan_ego_min_range=3.5m
-QUERY_MAX_RADIUS = 20.0
-QUERY_MIN_RADIUS = 3.5
-# Match SemanticKITTI default max_points (partial + query ~= full scene cap)
-DEFAULT_TARGET_TOTAL_POINTS = 20000
-
-
-def _build_cylindrical_grid(
-    min_radius: float,
-    max_radius: float,
-    z_min: float,
-    z_max: float,
-    voxel_size: float,
-) -> np.ndarray:
-    """Dense cylindrical candidate points (numpy)."""
-    r = np.arange(min_radius, max_radius + voxel_size * 0.5, voxel_size)
-    theta = np.arange(0, 2 * np.pi, max(voxel_size / max_radius, 1e-6))
-    z = np.arange(z_min, z_max + voxel_size * 0.5, voxel_size)
-    if r.size == 0 or theta.size == 0 or z.size == 0:
-        return np.zeros((0, 3), dtype=np.float64)
-    rr, tt, zz = np.meshgrid(r, theta, z, indexing="ij")
-    x = rr * np.cos(tt)
-    y = rr * np.sin(tt)
-    return np.stack([x, y, zz], axis=-1).reshape(-1, 3)
-
-
-def _uniform_frustum_fill(
-    n_needed: int,
-    partial_np: np.ndarray,
-    min_radius: float,
-    max_radius: float,
-    z_min: float,
-    z_max: float,
-    min_sep: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Sample points in cylindrical frustum, away from partial (rejection)."""
-    if n_needed <= 0:
-        return np.zeros((0, 3), dtype=np.float64)
-    tree = cKDTree(partial_np) if partial_np.shape[0] > 0 else None
-    out: list[np.ndarray] = []
-    max_tries = max(10000, n_needed * 200)
-    tries = 0
-    while len(out) < n_needed and tries < max_tries:
-        tries += 1
-        r = np.sqrt(rng.random() * (max_radius**2 - min_radius**2) + min_radius**2)
-        th = rng.random() * 2 * np.pi
-        z = z_min + rng.random() * (z_max - z_min)
-        p = np.array([r * np.cos(th), r * np.sin(th), z], dtype=np.float64)
-        if tree is not None:
-            d, _ = tree.query(p, k=1)
-            if d < min_sep:
-                continue
-        if out:
-            arr = np.stack(out, axis=0)
-            if np.linalg.norm(arr - p, axis=1).min() < min_sep * 0.4:
-                continue
-        out.append(p)
-    # Shortfall: jitter around partial / radial directions
-    short = n_needed - len(out)
-    if short > 0 and partial_np.shape[0] > 0:
-        for _ in range(short):
-            i = int(rng.integers(0, partial_np.shape[0]))
-            direction = partial_np[i].copy()
-            nrm = np.linalg.norm(direction[:2])
-            if nrm < 1e-3:
-                direction = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-            else:
-                direction = direction / (np.linalg.norm(direction) + 1e-9)
-            scale = rng.uniform(min_radius, max_radius)
-            p = direction * scale
-            p[2] = float(
-                np.clip(
-                    partial_np[i, 2] + rng.normal(0.0, 0.3),
-                    z_min,
-                    z_max,
-                )
-            )
-            out.append(p.astype(np.float64))
-    elif short > 0:
-        for _ in range(short):
-            r = np.sqrt(rng.random() * (max_radius**2 - min_radius**2) + min_radius**2)
-            th = rng.random() * 2 * np.pi
-            z = z_min + rng.random() * (z_max - z_min)
-            out.append(
-                np.array([r * np.cos(th), r * np.sin(th), z], dtype=np.float64)
-            )
-    return np.stack(out, axis=0)[:n_needed]
-
-
-def generate_query_points(
-    partial_coord: torch.Tensor,
-    max_radius: float = QUERY_MAX_RADIUS,
-    min_radius: float = QUERY_MIN_RADIUS,
-    voxel_size: float = 0.15,
-    target_total_points: int = DEFAULT_TARGET_TOTAL_POINTS,
-    rng: Optional[np.random.Generator] = None,
-) -> torch.Tensor:
-    """
-    Add exactly the number of query points needed to reach target_total_points.
-
-    num_query = max(0, target_total_points - len(partial)), aligned with training
-    where complete scenes are capped (e.g. SemanticKITTI max_points=20000).
-
-    Args:
-        partial_coord: (N, 3) partial scan coords (centered at origin)
-        max_radius: max distance from origin (m)
-        min_radius: min distance from origin (m)
-        voxel_size: initial grid step (m); refined if not enough candidates
-        target_total_points: desired total points (partial + query)
-        rng: optional RNG for subsampling / fill
-
-    Returns:
-        (target_total_points, 3) if N_partial < target; else partial only
-        (i.e. partial_coord unchanged when already at or above target)
-    """
-    device = partial_coord.device
-    rng = rng or np.random.default_rng()
-    partial_np = partial_coord.detach().cpu().numpy().astype(np.float64)
-    n_partial = int(partial_coord.shape[0])
-    num_query_needed = max(0, target_total_points - n_partial)
-    if num_query_needed == 0:
-        return partial_coord
-
-    z_min = float(np.clip(partial_np[:, 2].min() - 2.0, -max_radius, max_radius))
-    z_max = float(np.clip(partial_np[:, 2].max() + 2.0, -max_radius, max_radius))
-
-    v = float(voxel_size)
-    v_min = 0.05
-    grid = np.zeros((0, 3), dtype=np.float64)
-    for _ in range(10):
-        grid = _build_cylindrical_grid(
-            min_radius, max_radius, z_min, z_max, v
-        )
-        if partial_np.shape[0] > 0 and grid.shape[0] > 0:
-            tree = cKDTree(partial_np)
-            nn_dist, _ = tree.query(grid, k=1)
-            grid = grid[nn_dist > v * 0.6]
-        if grid.shape[0] >= num_query_needed:
-            break
-        v = max(v * 0.82, v_min)
-
-    if grid.shape[0] >= num_query_needed:
-        idx = rng.choice(grid.shape[0], num_query_needed, replace=False)
-        chosen = grid[idx]
-    elif grid.shape[0] > 0:
-        short = num_query_needed - grid.shape[0]
-        extra = _uniform_frustum_fill(
-            short,
-            partial_np,
-            min_radius,
-            max_radius,
-            z_min,
-            z_max,
-            min_sep=v_min * 0.6,
-            rng=rng,
-        )
-        chosen = np.vstack([grid, extra])
-    else:
-        chosen = _uniform_frustum_fill(
-            num_query_needed,
-            partial_np,
-            min_radius,
-            max_radius,
-            z_min,
-            z_max,
-            min_sep=v_min * 0.6,
-            rng=rng,
-        )
-
-    query_t = torch.from_numpy(chosen.astype(np.float32)).to(device)
-    return torch.cat([partial_coord, query_t], dim=0)
+    """Map features from source points to target points via nearest neighbor (GPU-friendly)."""
+    chunk = 4096
+    indices_list = []
+    dtype = source_coords.dtype
+    for s in range(0, target_coords.shape[0], chunk):
+        e = min(s + chunk, target_coords.shape[0])
+        d = torch.cdist(target_coords[s:e].float(), source_coords.float())
+        indices_list.append(d.argmin(dim=1))
+    indices = torch.cat(indices_list, dim=0).to(dtype=torch.long, device=features.device)
+    return features[indices]
 
 
 class SceneCompletionDiffusion(nn.Module):
@@ -932,6 +902,15 @@ class SceneCompletionDiffusion(nn.Module):
         num_timesteps: int = 1000,
         schedule: str = "cosine",
         denoising_steps: int = 50,
+        chamfer_max_points: int = 4096,
+        num_query_extra: Optional[int] = None,
+        query_radius: Optional[float] = None,
+        query_min_radius: float = QUERY_MIN_RADIUS,
+        chamfer_lambda: float = 0.1,
+        center_lambda: float = 0.02,
+        conditioning_mode: str = "concat",
+        conditioning_scale: float = 1.0,
+        condition_dropout_prob: float = 0.1,
     ):
         """
         Initialize complete diffusion model.
@@ -942,12 +921,34 @@ class SceneCompletionDiffusion(nn.Module):
             num_timesteps: Total diffusion steps
             schedule: Noise schedule type
             denoising_steps: Steps for inference
+            chamfer_max_points: Subsample cap for Chamfer in loss (memory)
+            num_query_extra: Random query count per sample (plus partial voxels)
+            query_radius: Cylinder radius for extra queries (sensor at origin)
+            query_min_radius: Inner xy radius excluded for synthetic queries (blind zone)
+            chamfer_lambda: Weight for Chamfer on predicted x0
+            center_lambda: Weight for global centroid alignment (anchor prior)
+            conditioning_mode: Denoiser fusion of Sonata features (concat | additive | film).
+            conditioning_scale: Strength for additive / FiLM (ignored for concat).
+            condition_dropout_prob: Training-only: zero cond with this prob (CFG-style; 0 = off).
         """
         super().__init__()
         
         self.encoder = encoder
         self.condition_extractor = condition_extractor
         self.denoising_steps = denoising_steps
+        self.chamfer_max_points = chamfer_max_points
+        self.num_query_extra = (
+            int(num_query_extra) if num_query_extra is not None else DEFAULT_TRAIN_MAX_POINTS
+        )
+        self.query_radius = (
+            float(query_radius) if query_radius is not None else float(QUERY_MAX_RADIUS)
+        )
+        self.query_min_radius = float(query_min_radius)
+        self.chamfer_lambda = chamfer_lambda
+        self.center_lambda = center_lambda
+        self.conditioning_mode = str(conditioning_mode).lower()
+        self.conditioning_scale = float(conditioning_scale)
+        self.condition_dropout_prob = float(condition_dropout_prob)
         
         # Diffusion scheduler
         self.scheduler = DiffusionScheduler(
@@ -955,12 +956,14 @@ class SceneCompletionDiffusion(nn.Module):
             schedule=schedule
         )
         
-        # Denoising network
+        # Denoising network: in_channels=3 => noise lives in coordinate space (x, y, z).
         self.denoiser = DenoisingNetwork(
             in_channels=3,
             condition_dim=condition_extractor.out_dim,
             hidden_dims=[64, 128, 256, 512],
-            time_embed_dim=128
+            time_embed_dim=128,
+            conditioning_mode=self.conditioning_mode,
+            conditioning_scale=self.conditioning_scale,
         )
     
     def forward(
@@ -970,78 +973,188 @@ class SceneCompletionDiffusion(nn.Module):
         complete_batch: torch.Tensor = None,
         return_loss: bool = True,
         condition_features: torch.Tensor = None,
+        log_metrics: bool = True,
+        log_conditioning: bool = False,
+        conditioning_loss_weight: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         """
-        Training forward pass.
-        
-        Args:
-            partial_scan: Incomplete input scan
-            complete_scan: Ground truth complete scene (N, 3)
-            return_loss: Whether to compute loss
-            
-        Returns:
-            Dictionary with predictions and losses
+        Training: diffuse NN-interpolated GT onto a fixed query shell; denoiser sees
+        noisy coords x_t and static query layout coords for graph geometry.
+
+        ``conditioning_loss_weight``: if > 0 in training, runs a second denoiser pass on the
+        same ``x_t``, timesteps, and noise with zero conditioning features. Noise loss is
+        ``loss_cond + weight * loss_zero`` where ``loss_*`` are MSE to ground-truth noise.
+        Logged ``conditioning_advantage`` is ``loss_zero - loss_cond`` (monitoring only).
         """
-        if condition_features is not None:
-            # Use pre-mapped condition features (from precomputed data)
-            cond_mapped = condition_features
-        else:
-            # Extract conditional features and map to complete_scan coords
-            cond_features, _ = self.condition_extractor(partial_scan)
-            cond_mapped = knn_interpolate(
-                cond_features, partial_scan['coord'], complete_scan
+        partial_coord = partial_scan["coord"]
+        partial_batch = partial_scan.get("batch")
+        if partial_batch is None:
+            partial_batch = torch.zeros(
+                partial_coord.shape[0], dtype=torch.long, device=partial_coord.device
             )
-        
-        # Handle batched data
+
+        query_coords, query_batch = build_query_shell_batched(
+            partial_coord,
+            partial_batch,
+            num_query=self.num_query_extra,
+            radius=self.query_radius,
+            min_radius=self.query_min_radius,
+        )
+
+        # GT targets on query points: NN in metric space from full GT cloud (per batch).
+        gt_x0 = knn_interpolate_batched(
+            complete_scan,
+            complete_scan,
+            query_coords,
+            complete_batch,
+            query_batch,
+        )
+
+        if condition_features is not None:
+            cond_mapped = knn_interpolate_batched(
+                condition_features,
+                complete_scan,
+                query_coords,
+                complete_batch,
+                query_batch,
+            )
+        else:
+            cond_features, _ = self.condition_extractor(partial_scan)
+            cond_mapped = knn_interpolate_batched(
+                cond_features,
+                partial_coord,
+                query_coords,
+                partial_batch,
+                query_batch,
+            )
+
+        # Training-only: randomly drop cond so the denoiser must handle both regimes (CFG-style).
+        # Skip dropout when computing the cond-vs-zero auxiliary (needs a clean cond path).
+        if (
+            self.training
+            and self.condition_dropout_prob > 0.0
+            and float(conditioning_loss_weight) <= 0.0
+        ):
+            if torch.rand(1).item() < self.condition_dropout_prob:
+                cond_mapped = torch.zeros_like(cond_mapped)
+
+        if log_conditioning:
+            print(
+                "COND stats (train, cond_mapped):",
+                cond_mapped.mean().item(),
+                cond_mapped.std().item(),
+            )
+
         if complete_batch is not None:
-            batch_size = complete_batch.max().item() + 1
+            batch_size = int(complete_batch.max().item()) + 1
         else:
             batch_size = 1
 
+        t_hi = self.scheduler.num_timesteps
+        t_lo = TRAIN_TIMESTEP_MIN if t_hi > TRAIN_TIMESTEP_MIN else 0
         t = torch.randint(
-            0, self.scheduler.num_timesteps,
-            (batch_size,), device=complete_scan.device
+            t_lo,
+            t_hi,
+            (batch_size,),
+            device=query_coords.device,
         )
+        t_per_point = t[query_batch]
 
-        # Per-point timesteps and noise scaling
-        noise = torch.randn_like(complete_scan)
-        if complete_batch is not None:
-            t_per_point = t[complete_batch]
-        else:
-            t_per_point = t.expand(complete_scan.shape[0])
-
-        dev = complete_scan.device
+        noise = torch.randn_like(gt_x0)
+        dev = query_coords.device
         sa = self.scheduler.sqrt_alphas_cumprod.to(dev)[t_per_point].unsqueeze(-1)
         som = self.scheduler.sqrt_one_minus_alphas_cumprod.to(dev)[t_per_point].unsqueeze(-1)
-        noisy_scan = sa * complete_scan + som * noise
+        x_t = sa * gt_x0 + som * noise
 
-        # Predict residual delta (x0 = x_t + delta) — more stable than noise prediction
-        pred_delta = self.denoiser(
-            noisy_scan, complete_scan, t_per_point, {'features': cond_mapped}
+        timestep_per_point = t_per_point.long()
+        pred_noise = self.denoiser(
+            x_t,
+            query_coords,
+            timestep_per_point,
+            {"features": cond_mapped},
         )
-        target_delta = complete_scan - noisy_scan
+        pred_noise = torch.clamp(pred_noise, -PRED_NOISE_CLAMP, PRED_NOISE_CLAMP)
 
-        if return_loss:
-            pred_x0 = noisy_scan + pred_delta
-            loss_delta = F.mse_loss(pred_delta, target_delta)
-            loss_x0 = F.mse_loss(pred_x0, complete_scan)
-            loss_chamfer = chamfer_distance_training(pred_x0, complete_scan)
-            t_norm = t.float().mean() / float(self.scheduler.num_timesteps)
-            geom_weight = 1.0 - t_norm
-            loss = (
-                1.0 * loss_delta
-                + 0.1 * loss_x0
-                + geom_weight * 0.02 * loss_chamfer
+        use_cond_aux = (
+            self.training
+            and float(conditioning_loss_weight) > 0.0
+            and return_loss
+        )
+        if use_cond_aux:
+            pred_noise_zero = self.denoiser(
+                x_t,
+                query_coords,
+                timestep_per_point,
+                {"features": torch.zeros_like(cond_mapped)},
             )
-            return {
-                'loss': loss,
-                'pred_delta': pred_delta,
-                'pred_x0': pred_x0,
-                'loss_delta': loss_delta,
-                'loss_x0': loss_x0,
-                'loss_chamfer': loss_chamfer,
-            }
-        return {'pred_delta': pred_delta}
+            pred_noise_zero = torch.clamp(
+                pred_noise_zero, -PRED_NOISE_CLAMP, PRED_NOISE_CLAMP
+            )
+        else:
+            pred_noise_zero = None
+
+        som_ab = self.scheduler.sqrt_one_minus_alphas_cumprod.to(dev)[t_per_point].unsqueeze(-1)
+        sqrt_ab = self.scheduler.sqrt_alphas_cumprod.to(dev)[t_per_point].unsqueeze(-1).clamp(min=1e-8)
+        pred_x0 = (x_t - som_ab * pred_noise) / sqrt_ab
+
+        if not return_loss:
+            return {"pred_noise": pred_noise, "pred_x0": pred_x0}
+
+        loss_cond = F.mse_loss(pred_noise, noise)
+        if use_cond_aux and pred_noise_zero is not None:
+            loss_zero = F.mse_loss(pred_noise_zero, noise)
+            lam = float(conditioning_loss_weight)
+            noise_loss = loss_cond + lam * loss_zero
+            conditioning_advantage = loss_zero - loss_cond
+        else:
+            loss_zero = None
+            conditioning_advantage = None
+            noise_loss = loss_cond
+
+        # Chamfer-only clamp: limits exploding ||pred_x0|| when sqrt(alpha_bar) is tiny (no loss mask:
+        # random queries already avoid r_xy < min_radius, while partial voxels may still lie inside).
+        Rc = self.query_radius
+        pred_x0_ch = torch.clamp(pred_x0, -Rc, Rc)
+        loss_chamfer = chamfer_symmetric_torch(
+            pred_x0_ch,
+            gt_x0,
+            max_points=self.chamfer_max_points,
+        )
+        pm = pred_x0_ch.mean(dim=0)
+        gm = gt_x0.mean(dim=0)
+        loss_center = torch.sum((pm - gm) ** 2)
+
+        main_loss = (
+            loss_cond
+            + self.chamfer_lambda * loss_chamfer
+            + self.center_lambda * loss_center
+        )
+        loss = (
+            noise_loss
+            + self.chamfer_lambda * loss_chamfer
+            + self.center_lambda * loss_center
+        )
+
+        out: Dict[str, torch.Tensor] = {
+            "loss": loss,
+            "main_loss": main_loss.detach(),
+            "loss_mse": loss_cond.detach(),
+            "loss_chamfer": loss_chamfer.detach(),
+            "loss_center": loss_center.detach(),
+            "loss_cond": loss_cond.detach(),
+            "loss_zero": loss_zero.detach() if loss_zero is not None else None,
+            "conditioning_advantage": (
+                conditioning_advantage.detach()
+                if conditioning_advantage is not None
+                else None
+            ),
+            "pred_noise": pred_noise,
+            "pred_x0": pred_x0,
+        }
+        if log_metrics:
+            out["pred_x0_mean"] = pred_x0.mean().detach()
+            out["pred_x0_std"] = pred_x0.std().detach()
+        return out
     
     @torch.no_grad()
     def complete_scene(
@@ -1049,88 +1162,128 @@ class SceneCompletionDiffusion(nn.Module):
         partial_scan: Dict[str, torch.Tensor],
         num_steps: Optional[int] = None,
         use_query_points: bool = True,
-        query_max_radius: float = QUERY_MAX_RADIUS,
-        query_min_radius: float = QUERY_MIN_RADIUS,
-        query_voxel_size: float = 0.15,
-        target_total_points: int = DEFAULT_TARGET_TOTAL_POINTS,
-        anchor_alpha: float = 0.9,
+        shell_coords: Optional[torch.Tensor] = None,
+        num_query_extra: Optional[int] = None,
+        query_radius: Optional[float] = None,
+        anchor_alpha: float = 1.0,
+        anchor_start_step: Optional[int] = None,
+        denoise_snapshot_iters: Optional[Set[int]] = None,
+        on_denoise_snapshot: Optional[Callable[[int, torch.Tensor], None]] = None,
+        target_coords: Optional[torch.Tensor] = None,
+        diagnostics: bool = False,
+        zero_condition: bool = False,
+        noise_seed: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        Complete scene from partial scan (inference).
+        Inference uses the same query shell as training when ``use_query_points``.
+        ``targetCoords`` / ``shell_coords`` override the learned layout if provided.
 
-        If use_query_points=True, generates query grid in [query_min_radius,
-        query_max_radius] (20m by default, aligned with map_from_scans_boost)
-        to allow hallucinating occluded regions.
+        ``anchor_start_step``: if set, anchor applies only on DDIM sub-steps with
+        ``t_idx <= anchor_start_step`` (``t_idx`` counts down from ``num_steps-1`` to ``0``).
+        When ``t_idx > anchor_start_step``, partial rows are left to the denoiser (softer LiDAR lock).
 
-        Args:
-            partial_scan: Incomplete input scan
-            num_steps: Number of denoising steps (default: self.denoising_steps)
-            use_query_points: Add query points in frustum for true completion
-            query_max_radius: Max radius (m), default 20
-            query_min_radius: Min radius (m), default 3.5
-            query_voxel_size: Grid step for query points
-            target_total_points: Partial + query count (missing = target - N_partial)
-            anchor_alpha: Soft constraint strength for observed points (0–1), default 0.9
-
-        Returns:
-            Completed scene point cloud (N, 3)
+        Diagnostic-only (no effect on training): ``diagnostics``, ``zero_condition``,
+        ``noise_seed`` — see ``scripts/diagnose_completion.py``.
         """
         if num_steps is None:
             num_steps = self.denoising_steps
 
-        # Extract conditional features (at partial positions)
-        cond_features, _ = self.condition_extractor(partial_scan)
-        partial_coord = partial_scan["coord"]
+        device = next(self.parameters()).device
+        for k in partial_scan:
+            if isinstance(partial_scan[k], torch.Tensor):
+                partial_scan[k] = partial_scan[k].to(device)
 
-        if use_query_points:
-            coords = generate_query_points(
+        partial_coord = partial_scan["coord"]
+        cond_features, _ = self.condition_extractor(partial_scan)
+
+        if target_coords is not None:
+            coords = target_coords.to(device)
+        elif shell_coords is not None:
+            coords = shell_coords.to(device)
+        elif use_query_points:
+            n_q = self.num_query_extra if num_query_extra is None else int(num_query_extra)
+            rad = self.query_radius if query_radius is None else float(query_radius)
+            coords = build_query_shell(
                 partial_coord,
-                max_radius=query_max_radius,
-                min_radius=query_min_radius,
-                voxel_size=query_voxel_size,
-                target_total_points=target_total_points,
+                num_query=n_q,
+                radius=rad,
+                min_radius=self.query_min_radius,
+                device=device,
             )
-            cond_mapped = knn_interpolate(cond_features, partial_coord, coords)
         else:
             coords = partial_coord
-            cond_mapped = cond_features
 
-        # Known (observed) points: first num_partial correspond to original partial scan
-        num_partial = partial_coord.shape[0]
-        known_mask = torch.zeros(
-            coords.shape[0], dtype=torch.bool, device=coords.device
-        )
-        known_mask[:num_partial] = True
-
-        # Start from coords + small noise (stable init, not pure random)
-        noise = torch.randn_like(coords)
-        x_t = coords + noise * 0.1
-
-        # Soft constraint: anchor observed points without hard reset
-        alpha = anchor_alpha
-
-        # Denoise step by step
-        timesteps = torch.linspace(
-            self.scheduler.num_timesteps - 1,
-            0,
-            num_steps,
-            dtype=torch.long,
-            device=x_t.device,
+        cond_features = knn_interpolate(
+            cond_features, partial_scan["coord"], coords
         )
 
-        for t in timesteps:
-            x_next = self.scheduler.p_sample_step(
-                self.denoiser,
-                x_t,
-                coords,
-                t.item(),
-                {"features": cond_mapped},
+        if zero_condition:
+            cond_features = torch.zeros_like(cond_features)
+
+        if diagnostics:
+            print(
+                "COND stats:",
+                cond_features.mean().item(),
+                cond_features.std().item(),
             )
-            x_t = x_next.clone()
-            # Soft constraint for known (observed) points
-            x_t[known_mask] = (
-                alpha * partial_coord
-                + (1.0 - alpha) * x_next[known_mask]
+            n_q = int(coords.shape[0]) - int(partial_coord.shape[0])
+            r_eff = (
+                float(query_radius)
+                if query_radius is not None
+                else float(self.query_radius)
+            )
+            print(
+                "Shell info: partial:",
+                partial_coord.shape[0],
+                "total:",
+                coords.shape[0],
+                "query:",
+                n_q,
+            )
+            print("Radius:", r_eff, "| Min radius:", float(self.query_min_radius))
+
+        if noise_seed is not None:
+            g = torch.Generator(device=device)
+            g.manual_seed(int(noise_seed))
+            x_t = torch.randn(
+                coords.shape, dtype=coords.dtype, device=device, generator=g
+            )
+        else:
+            x_t = torch.randn_like(coords)
+
+        n_partial = int(partial_coord.shape[0])
+        x_init = x_t.clone() if diagnostics else None
+
+        if denoise_snapshot_iters is not None and on_denoise_snapshot is not None and 0 in denoise_snapshot_iters:
+            on_denoise_snapshot(0, x_t)
+
+        for step_i, t in enumerate(range(num_steps - 1, -1, -1)):
+            x_t = self.scheduler.p_sample_step(
+                self.denoiser, x_t, coords, t, {"features": cond_features}
+            )
+            apply_anchor = n_partial > 0 and float(anchor_alpha) != 0.0
+            if apply_anchor and anchor_start_step is not None:
+                if t > int(anchor_start_step):
+                    apply_anchor = False
+            if apply_anchor:
+                aa = float(anchor_alpha)
+                if aa < 1.0:
+                    x_t[:n_partial] = (
+                        aa * partial_coord + (1.0 - aa) * x_t[:n_partial]
+                    )
+                else:
+                    x_t[:n_partial] = partial_coord
+            if (
+                denoise_snapshot_iters is not None
+                and on_denoise_snapshot is not None
+                and (step_i + 1) in denoise_snapshot_iters
+            ):
+                on_denoise_snapshot(step_i + 1, x_t)
+
+        if diagnostics and x_init is not None:
+            print(
+                "Diffusion movement:",
+                (x_t - x_init).abs().mean().item(),
             )
 
         return x_t

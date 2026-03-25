@@ -11,6 +11,8 @@ from torch.utils.data import Dataset
 from typing import Dict, List, Tuple, Optional
 import yaml
 
+from utils.point_cloud import crop_lidar_radius, crop_lidar_radius_with_labels
+
 
 class SemanticKITTI(Dataset):
     """
@@ -67,9 +69,16 @@ class SemanticKITTI(Dataset):
     # Not the official SemanticKITTI benchmark (that uses val=08, test=11–21).
     # train: 01–08, val: 09, test: 10. Add '00' to train if you want that scene in training.
     SPLITS = {
-        'train': ['00','01', '02', '03', '04', '05', '06', '07', '08'],
+        'train': ['00', '01', '02', '03', '04', '05', '06', '07', '08'],
         'val': ['09'],
         'test': ['10'],
+    }
+
+    # Official SemanticKITTI: val=08, test=11–21 (no labels on test; need GT maps if you train/eval with GT).
+    SPLITS_OFFICIAL = {
+        'train': ['00', '01', '02', '03', '04', '05', '06', '07', '09', '10'],
+        'val': ['08'],
+        'test': [f'{i:02d}' for i in range(11, 22)],
     }
     
     def __init__(
@@ -84,6 +93,13 @@ class SemanticKITTI(Dataset):
         use_precomputed: bool = False,
         gt_subdir: str = "ground_truth",
         gt_name_suffix: str = "",
+        split_preset: str = 'project',
+        sequence_ids: Optional[List[str]] = None,
+        intra_seq_val_fraction: float = 0.0,
+        intra_seq_test_fraction: float = 0.0,
+        scene_radius: float = 0.0,
+        sequence_scan_start: Optional[int] = None,
+        sequence_scan_end: Optional[int] = None,
     ):
         """
         Initialize SemanticKITTI dataset.
@@ -98,6 +114,21 @@ class SemanticKITTI(Dataset):
             num_points_per_scan: Subsample scans to this number
             gt_subdir: Subfolder under root for GT NPZ (e.g. ground_truth_v2)
             gt_name_suffix: Filename suffix before .npz (e.g. _v2 -> 000000_v2.npz)
+            split_preset: 'project' (SPLITS) or 'official' (SPLITS_OFFICIAL)
+            sequence_ids: If set, use only these sequence ids (e.g. ['03'] or ['11','12']);
+                overrides split_preset list for this split.
+            intra_seq_val_fraction: If intra_seq_test_fraction==0 and this >0: two-way split —
+                first (1-f) scans for train, last f for val. If intra_seq_test_fraction>0:
+                three-way split — middle segment has fraction f (val), last segment has
+                intra_seq_test_fraction (test), first segment is the rest (train).
+            intra_seq_test_fraction: If >0, three-way temporal split (requires val fraction >0
+                and exactly one sequence). split='train'|'val'|'test' selects the segment.
+            scene_radius: If >0, crop raw LiDAR (with labels) and GT map points to this
+                Euclidean radius (m) from sensor origin before voxelize (match inference).
+            sequence_scan_start: If set (with a single sequence), keep scans from this
+                0-based index onward (inclusive), after sorting by filename within the sequence.
+            sequence_scan_end: If set, exclusive end index (Python slice). E.g. start=0,
+                end=600 uses scans 0..599. Applied before intra-sequence train/val/test split.
         """
         super().__init__()
         
@@ -111,9 +142,19 @@ class SemanticKITTI(Dataset):
         self.augmentation = augmentation
         self.num_points_per_scan = num_points_per_scan
         self.use_precomputed = use_precomputed
-        
-        # Get sequences for this split
-        self.sequences = self.SPLITS[split]
+        self.split_preset = split_preset
+        self.intra_seq_val_fraction = float(intra_seq_val_fraction)
+        self.intra_seq_test_fraction = float(intra_seq_test_fraction)
+        self.scene_radius = float(scene_radius)
+
+        if sequence_ids is not None:
+            self.sequences = [s.strip() for s in sequence_ids if str(s).strip()]
+            if not self.sequences:
+                raise ValueError("sequence_ids expanded to an empty list")
+        elif split_preset == 'official':
+            self.sequences = list(self.SPLITS_OFFICIAL[split])
+        else:
+            self.sequences = list(self.SPLITS[split])
         
         # Build file lists
         self.scan_files = []
@@ -122,6 +163,38 @@ class SemanticKITTI(Dataset):
         self.gt_map_files = []
         
         self._build_file_lists()
+
+        self._apply_sequence_scan_window(sequence_scan_start, sequence_scan_end)
+
+        if self.intra_seq_test_fraction > 0:
+            if self.intra_seq_val_fraction <= 0 or self.intra_seq_val_fraction >= 1.0:
+                raise ValueError(
+                    "intra_seq_test_fraction>0 requires intra_seq_val_fraction in (0,1) "
+                    "(middle val segment)"
+                )
+            tr = 1.0 - self.intra_seq_val_fraction - self.intra_seq_test_fraction
+            if tr <= 0:
+                raise ValueError(
+                    "Train fraction 1 - val - test must be positive; "
+                    "reduce intra_seq_val_fraction or intra_seq_test_fraction"
+                )
+            if len(self.sequences) != 1:
+                raise ValueError(
+                    "Three-way intra-sequence split requires exactly one sequence in sequence_ids"
+                )
+            self._apply_intra_sequence_three_way()
+        elif self.intra_seq_val_fraction > 0:
+            if self.split == 'test':
+                raise ValueError(
+                    "intra_seq_val_fraction (two-way) is only for train/val; "
+                    "use intra_seq_test_fraction>0 for a test segment"
+                )
+            if len(self.sequences) != 1:
+                raise ValueError(
+                    "intra_seq_val_fraction requires exactly one sequence "
+                    "(pass sequence_ids='03' or similar)"
+                )
+            self._apply_intra_sequence_holdout()
 
         # Filter to only samples with existing precomputed features
         if self.use_precomputed:
@@ -140,6 +213,8 @@ class SemanticKITTI(Dataset):
             print(
                 f"  GT maps: .../{self.gt_subdir}/<seq>/*{self.gt_name_suffix}.npz"
             )
+        if self.scene_radius > 0:
+            print(f"  Scene crop radius: {self.scene_radius} m (LiDAR + GT, before voxelize)")
     
     def _build_file_lists(self):
         """Build lists of data files."""
@@ -187,10 +262,81 @@ class SemanticKITTI(Dataset):
                 self.scan_files.append(scan_path)
                 self.label_files.append(label_path)
                 self.pose_files.append(pose_path)
-    
+
+    def _apply_intra_sequence_holdout(self) -> None:
+        """Time-ordered holdout within a single sequence (sorted scan ids)."""
+        n = len(self.scan_files)
+        if n == 0:
+            return
+        f = self.intra_seq_val_fraction
+        if f <= 0.0 or f >= 1.0:
+            raise ValueError("intra_seq_val_fraction must be in (0, 1)")
+        cut = int(round(n * (1.0 - f)))
+        cut = max(1, min(n - 1, cut))
+        if self.split == 'train':
+            idx_range = slice(0, cut)
+        else:
+            idx_range = slice(cut, n)
+        self._slice_sample_lists(idx_range)
+
+    def _apply_intra_sequence_three_way(self) -> None:
+        """Time-ordered train | val | test within one sequence (sorted scan ids)."""
+        n = len(self.scan_files)
+        if n == 0:
+            return
+        train_f = 1.0 - self.intra_seq_val_fraction - self.intra_seq_test_fraction
+        cut1 = int(round(n * train_f))
+        cut2 = int(round(n * (train_f + self.intra_seq_val_fraction)))
+        cut1 = max(1, min(cut1, n - 2))
+        cut2 = max(cut1 + 1, min(cut2, n - 1))
+        if self.split == 'train':
+            idx_range = slice(0, cut1)
+        elif self.split == 'val':
+            idx_range = slice(cut1, cut2)
+        else:
+            idx_range = slice(cut2, n)
+        self._slice_sample_lists(idx_range)
+
+    def _apply_sequence_scan_window(
+        self,
+        start: Optional[int],
+        end: Optional[int],
+    ) -> None:
+        """Restrict to ``[start, end)`` scan indices within the only sequence (after sort)."""
+        if start is None and end is None:
+            return
+        if len(self.sequences) != 1:
+            raise ValueError(
+                "sequence_scan_start / sequence_scan_end require exactly one sequence "
+                "(pass sequence_ids with a single id, e.g. ['02'])"
+            )
+        n = len(self.scan_files)
+        s = 0 if start is None else int(start)
+        e = n if end is None else int(end)
+        if s < 0 or e < 0:
+            raise ValueError("sequence_scan_start / sequence_scan_end must be non-negative")
+        if s > n:
+            raise ValueError(f"sequence_scan_start {s} is past num scans {n}")
+        e = min(e, n)
+        if e <= s:
+            raise ValueError(
+                f"Empty sequence scan window: start={s} end={e} (end is exclusive; need end > start)"
+            )
+        self._slice_sample_lists(slice(s, e))
+        print(f"  Sequence scan window: indices [{s}, {e}) → {e - s} scans")
+
+    def _slice_sample_lists(self, idx_range: slice) -> None:
+        self.scan_files = self.scan_files[idx_range]
+        self.label_files = self.label_files[idx_range]
+        self.pose_files = self.pose_files[idx_range]
+        if self.use_ground_truth_maps:
+            self.gt_map_files = self.gt_map_files[idx_range]
+        if hasattr(self, "precomputed_files"):
+            self.precomputed_files = self.precomputed_files[idx_range]
+
     def __len__(self) -> int:
         return len(self.scan_files)
-    
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         Load a single sample.
@@ -209,6 +355,11 @@ class SemanticKITTI(Dataset):
                 precomp = np.load(precomp_path)
                 cc = precomp["complete_coord"].astype(np.float32)
                 cl = precomp["complete_labels"].astype(np.int64)
+                if self.scene_radius > 0 and cc.shape[0] > 0:
+                    d = np.linalg.norm(cc.astype(np.float64), axis=1)
+                    m = d <= self.scene_radius + 1e-5
+                    cc = cc[m]
+                    cl = cl[m]
                 cf = precomp["condition_features"]
                 sc = precomp["scan_center"].astype(np.float32)
                 return {
@@ -240,6 +391,12 @@ class SemanticKITTI(Dataset):
         else:
             # Use scan itself as GT for testing
             gt_complete = scan.copy()
+
+        if self.scene_radius > 0:
+            scan, labels = crop_lidar_radius_with_labels(
+                scan, labels, self.scene_radius
+            )
+            gt_complete = crop_lidar_radius(gt_complete, self.scene_radius)
         
         # Subsample scan if needed
         if self.num_points_per_scan is not None:

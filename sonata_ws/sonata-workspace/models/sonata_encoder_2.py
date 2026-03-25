@@ -78,45 +78,23 @@ class SonataEncoder(nn.Module):
             
             if not enable_flash:
                 custom_config['enable_flash'] = False
-                # Default fallback patch size when flash-attn is unavailable.
-                # Keep relatively large patches to avoid excessive overhead.
-                custom_config['enc_patch_size'] = [1024] * 5
+                custom_config['enc_patch_size'] = [128] * 5  # Reduced for 24GB GPU
             
             # Import Sonata model
             try:
                 from sonata.model import PointTransformerV3
-                try:
-                    model = PointTransformerV3.from_pretrained(model_id, **custom_config)
-                except AssertionError as e:
-                    # Some Sonata builds assert flash_attn is installed even if users
-                    # intend to run without it. Retry with flash explicitly disabled.
-                    msg = str(e)
-                    if "flash_attn" in msg or "flash" in msg:
-                        print("FlashAttention not available; retrying Sonata load with enable_flash=False...")
-                        retry_cfg = dict(custom_config)
-                        retry_cfg["enable_flash"] = False
-                        retry_cfg.setdefault("enc_patch_size", [1024] * 5)
-                        model = PointTransformerV3.from_pretrained(model_id, **retry_cfg)
-                    else:
-                        raise
+                model = PointTransformerV3.from_pretrained(
+                    model_id, **custom_config
+                )
             except ImportError:
                 print("Sonata not installed as package, trying direct import...")
                 # Add fallback for standalone mode
                 import sys
                 sys.path.insert(0, './sonata')
                 from model import PointTransformerV3
-                try:
-                    model = PointTransformerV3.from_pretrained(model_id, **custom_config)
-                except AssertionError as e:
-                    msg = str(e)
-                    if "flash_attn" in msg or "flash" in msg:
-                        print("FlashAttention not available; retrying Sonata load with enable_flash=False...")
-                        retry_cfg = dict(custom_config)
-                        retry_cfg["enable_flash"] = False
-                        retry_cfg.setdefault("enc_patch_size", [1024] * 5)
-                        model = PointTransformerV3.from_pretrained(model_id, **retry_cfg)
-                    else:
-                        raise
+                model = PointTransformerV3.from_pretrained(
+                    model_id, **custom_config
+                )
                 
             return model
             

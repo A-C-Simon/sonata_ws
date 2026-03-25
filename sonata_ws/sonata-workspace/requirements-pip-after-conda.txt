@@ -1,0 +1,17 @@
+# Used after conda installs pytorch + torchvision (see environment.yml).
+# Keeps one CUDA stack from conda; then spconv / rest via pip.
+
+numpy>=1.21.0,<2.0
+scipy==1.11.4
+spconv-cu124
+open3d>=0.16.0
+huggingface_hub
+timm
+pyyaml>=5.4.0
+h5py>=3.0.0
+tensorboard>=2.8.0
+tqdm>=4.60.0
+matplotlib>=3.3.0
+pillow>=8.0.0
+scikit-learn>=0.24.0
+psutil

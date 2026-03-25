@@ -18,3 +18,8 @@ sonata_ws/sonata-workspace/logs/
 sonata_ws/sonata-workspace/gt_maps_refined/
 sonata_ws/sonata-workspace/sonata/
 **/sonata_lidiff.egg-info/
+sonata_ws/sonata-workspace/.venv_open3d/
+sonata_ws/sonata-workspace/evaluation_results_teacher/
+sonata_ws/sonata-workspace/evaluation_results_teacher_gt_v2/
+sonata_ws/sonata-workspace/evaluation_results_teacher_gt_v2_n20/
+sonata_ws/sonata-workspace/evaluation_results_teacher_n20/

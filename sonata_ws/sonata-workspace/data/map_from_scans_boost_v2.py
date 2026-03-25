@@ -8,6 +8,9 @@ Pipeline: pose = база, ICP = малая коррекция к локальн
 
 Отличие от boost v1: chain ICP (scan→scan→scan) заменён на anchor ICP (scan→map).
 
+Скрипт самодостаточен: общие хелперы (воксель, SOR/ROR, финализация кадра) встроены здесь,
+отдельный map_from_scans_boost.py не нужен.
+
   python data/map_from_scans_boost_v2.py -p .../sequences -s 00 --scan_ids 000000
 """
 
@@ -27,31 +30,337 @@ _REPO_ROOT = os.path.dirname(_DATA_DIR)
 if _DATA_DIR not in sys.path:
     sys.path.insert(0, _DATA_DIR)
 
-from map_from_scans_boost import (
-    BOOST,
-    BOOST_DEFAULT_SEQUENCES,
-    _DEFAULT_GT_EXPORT,
-    _boost_gt_npz_path,
-    _load_kitti_scan_to_world,
-    boost_finalize_frame_from_fused,
-    crop_window_scan_for_merge,
-    fast_icp_align,
-    ror_filter,
-    sor_filter,
-    symmetric_window_bounds,
-)
 from map_from_scans import load_poses, voxelize  # noqa: E402
+
+_DEFAULT_GT_EXPORT = os.path.join(_REPO_ROOT, "gt_maps_refined")
+
+
+@dataclass(frozen=True)
+class BoostDefaults:
+    """Shared GT fusion defaults (formerly map_from_scans_boost.py)."""
+
+    voxel_size: float = 0.1
+    backend: str = "open3d"
+    output_subdir: str = "ground_truth"
+    max_gt_points: int = 200_000
+    window_half: int = 20
+    accumulation_radius: float = 15.0
+    output_radius: float = 20.0
+    force: bool = False
+    quiet: bool = False
+    scan_ego_min_range_m: float = 3.5
+    scan_load_presample_cap: int = 50_000
+    use_sor: bool = True
+    use_ror: bool = True
+    sor_nb_neighbors: int = 12
+    sor_std_ratio: float = 2.0
+    ror_nb_points: int = 5
+    ror_radius: float = 0.5
+    use_icp: bool = True
+    icp_max_iter: int = 5
+    icp_threshold: float = 1.0
+    icp_downsample: float = 0.25
+
+
+BOOST = BoostDefaults()
+
+BOOST_DEFAULT_SEQUENCES: tuple[str, ...] = (
+    "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10",
+)
+
+
+def _sor_filter_scipy(
+    points: np.ndarray, nb_neighbors: int, std_ratio: float
+) -> np.ndarray:
+    from scipy.spatial import cKDTree
+
+    pts = np.asarray(points[:, :3], dtype=np.float64)
+    n = pts.shape[0]
+    if n < 50:
+        return points
+    k = min(max(2, nb_neighbors), n - 1)
+    tree = cKDTree(pts)
+    try:
+        dists, _ = tree.query(pts, k=k + 1, workers=-1)
+    except TypeError:
+        dists, _ = tree.query(pts, k=k + 1)
+    mean_d = dists[:, 1:].mean(axis=1)
+    mu, sigma = float(mean_d.mean()), float(mean_d.std()) + 1e-9
+    keep = mean_d <= mu + std_ratio * sigma
+    return np.asarray(points[keep], dtype=np.float64)
+
+
+def _ror_filter_scipy(
+    points: np.ndarray, nb_points: int, radius: float
+) -> np.ndarray:
+    from scipy.spatial import cKDTree
+
+    pts = np.asarray(points[:, :3], dtype=np.float64)
+    n = pts.shape[0]
+    if n < 50:
+        return points
+    tree = cKDTree(pts)
+    try:
+        neighbors = tree.query_ball_point(pts, r=radius, workers=-1)
+    except TypeError:
+        neighbors = tree.query_ball_point(pts, r=radius)
+    counts = np.array([len(neighbors[i]) for i in range(len(neighbors))])
+    return np.asarray(points[counts >= nb_points], dtype=np.float64)
+
+
+def sor_filter(
+    points: np.ndarray,
+    nb_neighbors: int = 12,
+    std_ratio: float = 2.0,
+    max_points: int = 100_000,
+) -> np.ndarray:
+    """Statistical outlier removal (Open3D if available, else scipy)."""
+    if points.shape[0] < 50:
+        return points
+    try:
+        import open3d as o3d
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(
+            np.asarray(points[:, :3], dtype=np.float64)
+        )
+        if points.shape[0] > max_points:
+            pcd = pcd.voxel_down_sample(0.12)
+        pcd, _ = pcd.remove_statistical_outlier(
+            nb_neighbors=nb_neighbors,
+            std_ratio=std_ratio,
+        )
+        return np.asarray(pcd.points, dtype=np.float64)
+    except (ImportError, OSError):
+        return _sor_filter_scipy(points, nb_neighbors, std_ratio)
+
+
+def ror_filter(
+    points: np.ndarray,
+    nb_points: int = 5,
+    radius: float = 0.5,
+    max_points: int = 100_000,
+) -> np.ndarray:
+    """Radius outlier removal (Open3D if available, else scipy)."""
+    if points.shape[0] < 50:
+        return points
+    try:
+        import open3d as o3d
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(
+            np.asarray(points[:, :3], dtype=np.float64)
+        )
+        if points.shape[0] > max_points:
+            pcd = pcd.voxel_down_sample(0.12)
+        pcd, _ = pcd.remove_radius_outlier(
+            nb_points=nb_points,
+            radius=radius,
+        )
+        return np.asarray(pcd.points, dtype=np.float64)
+    except (ImportError, OSError):
+        return _ror_filter_scipy(points, nb_points, radius)
+
+
+def _valid_icp(T: np.ndarray, max_t: float = 0.5, max_deg: float = 5.0) -> bool:
+    t = np.linalg.norm(T[:3, 3])
+    R = T[:3, :3]
+    val = (np.trace(R) - 1) / 2
+    val = np.clip(val, -1.0, 1.0)
+    ang = np.degrees(np.arccos(val))
+    return t < max_t and ang < max_deg
+
+
+def fast_icp_align(
+    src_pts: np.ndarray,
+    tgt_pts: np.ndarray,
+    max_iter: int = 10,
+    threshold: float = 1.0,
+    downsample_voxel: float = 0.0,
+) -> np.ndarray:
+    """Point-to-point ICP (requires Open3D)."""
+    if src_pts.shape[0] < 50 or tgt_pts.shape[0] < 50:
+        return src_pts.copy()
+    import open3d as o3d
+
+    src = o3d.geometry.PointCloud()
+    tgt = o3d.geometry.PointCloud()
+    src.points = o3d.utility.Vector3dVector(
+        np.asarray(src_pts[:, :3], dtype=np.float64)
+    )
+    tgt.points = o3d.utility.Vector3dVector(
+        np.asarray(tgt_pts[:, :3], dtype=np.float64)
+    )
+    if downsample_voxel > 0:
+        src = src.voxel_down_sample(downsample_voxel)
+        tgt = tgt.voxel_down_sample(downsample_voxel)
+        if len(src.points) < 20 or len(tgt.points) < 20:
+            src = o3d.geometry.PointCloud()
+            tgt = o3d.geometry.PointCloud()
+            src.points = o3d.utility.Vector3dVector(
+                np.asarray(src_pts[:, :3], dtype=np.float64)
+            )
+            tgt.points = o3d.utility.Vector3dVector(
+                np.asarray(tgt_pts[:, :3], dtype=np.float64)
+            )
+    reg = o3d.pipelines.registration.registration_icp(
+        src,
+        tgt,
+        threshold,
+        np.eye(4),
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter),
+    )
+    T = np.asarray(reg.transformation, dtype=np.float64)
+    if not _valid_icp(T):
+        return np.asarray(src_pts[:, :3], dtype=np.float64).copy()
+    pts_h = np.hstack(
+        [np.asarray(src_pts[:, :3], dtype=np.float64), np.ones((src_pts.shape[0], 1))]
+    )
+    aligned_full = (T @ pts_h.T).T[:, :3]
+    return aligned_full
+
+
+def crop_by_radius(
+    points: np.ndarray, center: np.ndarray, radius: float
+) -> np.ndarray:
+    if radius is None or radius <= 0 or points.shape[0] == 0:
+        return points
+    c = np.asarray(center, dtype=np.float64).reshape(1, 3)
+    dist = np.linalg.norm(points[:, :3] - c, axis=1)
+    return points[dist < radius]
+
+
+def crop_window_scan_for_merge(
+    pts: np.ndarray,
+    scan_idx: int,
+    poses: np.ndarray,
+    radius: float,
+) -> np.ndarray:
+    if radius is None or radius <= 0 or pts.shape[0] == 0:
+        return pts
+    c = poses[scan_idx][:3, 3].astype(np.float64)
+    return crop_by_radius(pts, c, radius)
+
+
+def symmetric_window_bounds(i: int, n_scans: int, half: int) -> tuple[int, int]:
+    if n_scans <= 0 or half < 0:
+        return 0, 0
+    lo = max(0, i - half)
+    hi = min(n_scans, i + half + 1)
+    return lo, hi
+
+
+def _boost_gt_npz_path(
+    gt_seq_dir: str, scan_files: list, frame_idx: int, name_suffix: str
+) -> str:
+    sid = scan_files[frame_idx].replace(".bin", "")
+    base = f"{sid}{name_suffix}" if name_suffix else sid
+    return os.path.join(gt_seq_dir, f"{base}.npz")
+
+
+def _load_kitti_scan_to_world(
+    idx: int,
+    scan_files: list,
+    velodyne_dir: str,
+    labels_dir: str,
+    poses: np.ndarray,
+) -> np.ndarray:
+    sf = scan_files[idx]
+    sp = os.path.join(velodyne_dir, sf)
+    pts = np.fromfile(sp, dtype=np.float32).reshape(-1, 4)
+    lp = os.path.join(labels_dir, sf.replace(".bin", ".label"))
+    if os.path.exists(lp):
+        lb = np.fromfile(lp, dtype=np.uint32) & 0xFFFF
+        mask = (lb < 252) | (lb > 259)
+        if mask.sum() < len(lb):
+            pts = pts[mask]
+    dist = np.linalg.norm(pts[:, :3], axis=1)
+    pts = pts[dist > BOOST.scan_ego_min_range_m]
+    cap = BOOST.scan_load_presample_cap
+    if len(pts) > cap:
+        pts = pts[np.random.choice(len(pts), cap, replace=False)]
+    ones = np.ones((pts.shape[0], 1))
+    homo = np.hstack([pts[:, :3], ones])
+    return (poses[idx] @ homo.T).T[:, :3]
+
+
+def boost_finalize_frame_from_fused(
+    i: int,
+    all_pts: np.ndarray,
+    local_pts: list,
+    c: dict,
+) -> None:
+    del local_pts
+    scan_files = c["scan_files"]
+    poses = c["poses"]
+    gt_seq_dir = c["gt_seq_dir"]
+    output_name_suffix = c["output_name_suffix"]
+    force = c["force"]
+    voxel_size = c["voxel_size"]
+    backend = c["backend"]
+
+    out_path = _boost_gt_npz_path(gt_seq_dir, scan_files, i, output_name_suffix)
+    if os.path.exists(out_path) and not force:
+        return
+
+    ego_w = np.asarray(poses[i][:3, 3], dtype=np.float64)
+    pose_inv = np.linalg.inv(np.asarray(poses[i], dtype=np.float64))
+
+    output_radius = float(c["output_radius"])
+    if output_radius > 0 and all_pts.shape[0] > 0:
+        all_pts_f64 = np.asarray(all_pts, dtype=np.float64)
+        n_before = all_pts_f64.shape[0]
+        cropped = crop_by_radius(all_pts_f64, ego_w, output_radius)
+        if cropped.shape[0] == 0:
+            print(f"WARNING: empty crop at frame {i}")
+        elif n_before > 500 and cropped.shape[0] < n_before * 0.1:
+            print(
+                f"WARNING: crop removed >90% points at frame {i} "
+                f"({n_before} -> {cropped.shape[0]})"
+            )
+        all_pts = cropped
+
+    if all_pts.shape[0] < 100:
+        print(f"WARNING: low point count after fusion at frame {i}: {all_pts.shape[0]}")
+
+    map_voxel = voxelize(all_pts, voxel_size, backend=backend)
+    if c.get("use_sor", False):
+        map_voxel = sor_filter(
+            map_voxel,
+            nb_neighbors=c.get("sor_nb_neighbors", 20),
+            std_ratio=c.get("sor_std_ratio", 2.0),
+        )
+    if c.get("use_ror", False):
+        map_voxel = ror_filter(
+            map_voxel,
+            nb_points=c.get("ror_nb_points", 5),
+            radius=c.get("ror_radius", 0.5),
+        )
+
+    ones = np.ones((map_voxel.shape[0], 1))
+    map_scan = (
+        pose_inv @ np.hstack([np.asarray(map_voxel, dtype=np.float64), ones]).T
+    ).T[:, :3].astype(np.float32)
+
+    max_gt_points = c["max_gt_points"]
+    if len(map_scan) > max_gt_points:
+        idx_sub = np.random.choice(len(map_scan), max_gt_points, replace=False)
+        map_scan = map_scan[idx_sub]
+
+    np.savez_compressed(out_path, points=map_scan.astype(np.float32))
 
 
 @dataclass(frozen=True)
 class BoostV2Defaults:
     """Boost 2.0: anchor ICP, drift-free (speed-optimized defaults)."""
 
-    icp_correction_max: float = 0.15  # max mean point displacement to accept ICP
-    icp_reference_n: int = 3  # last N scans as reference (speed vs quality)
-    icp_downsample: float = 0.35  # voxel size before ICP (larger = faster)
+    icp_correction_max: float = 0.15
+    icp_reference_n: int = 3
+    icp_downsample: float = 0.35
     icp_max_iter: int = 4
-    window_half: int = 17  # ±N scans in window (35 total)
+    icp_threshold: float = 1.0
+    window_half: int = 17
     sor_nb_neighbors: int = 10
 
 

@@ -8,16 +8,30 @@ import os
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 import argparse
 import yaml
 from tqdm import tqdm
+
+try:
+    from torch.utils.tensorboard import SummaryWriter  # type: ignore
+except Exception:  # pragma: no cover
+    SummaryWriter = None
+
+    class _NoOpSummaryWriter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def add_scalar(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.refinement_dataset import RefinementDataset, collate_refinement
-from models.refinement_net import RefinementNetwork, chamfer_distance
+from models.refinement_net_2 import RefinementNetwork, chamfer_distance
 from utils.checkpoint import save_checkpoint, load_checkpoint
 
 
@@ -25,23 +39,29 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train refinement network")
     parser.add_argument("--data_path", type=str, default=os.path.expanduser("~/Simon_ws/dataset/SemanticKITTI/dataset"))
     parser.add_argument(
-        "--gt_subdir", type=str, default="ground_truth",
-        help="GT subfolder (e.g. ground_truth_v2)",
+        "--gt_variant", type=str, default="ground_truth",
+        help="Ground-truth subdir under data_path (e.g. 'ground_truth_v2')"
     )
     parser.add_argument(
         "--gt_name_suffix", type=str, default="",
-        help="GT filename suffix (e.g. _v2)",
+        help="Optional GT filename suffix before .npz (e.g. _v2 -> 000000_v2.npz)"
+    )
+    parser.add_argument(
+        "--sequences", type=str, nargs="+", default=None,
+        help="Optional sequence override, e.g. --sequences 00"
+    )
+    parser.add_argument(
+        "--max_scans_per_sequence", type=int, default=None,
+        help="Optional cap per sequence (for quick smoke runs)"
+    )
+    parser.add_argument(
+        "--debug_data", action="store_true",
+        help="Print a few dataset samples' shapes/paths and assert non-empty GT"
     )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument(
-        "--coarse_voxel_size", type=float, default=0.2,
-        help="Coarser than fine (default 0.2 vs fine 0.1)",
-    )
-    parser.add_argument(
-        "--fine_voxel_size", type=float, default=0.1,
-        help="Match diffusion / boost GT voxel (default 0.1)",
-    )
+    parser.add_argument("--coarse_voxel_size", type=float, default=0.1)
+    parser.add_argument("--fine_voxel_size", type=float, default=0.05)
     parser.add_argument("--up_factor", type=int, default=6)
     parser.add_argument("--num_epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -113,7 +133,15 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
-    writer = SummaryWriter(args.log_dir)
+    if SummaryWriter is None:
+        print(
+            "Warning: tensorboard is not installed. "
+            "Continuing without TensorBoard logs. "
+            "Install with: pip install tensorboard"
+        )
+        writer = _NoOpSummaryWriter()
+    else:
+        writer = SummaryWriter(args.log_dir)
 
     print("Loading refinement dataset...")
     train_dataset = RefinementDataset(
@@ -122,9 +150,15 @@ def main():
         coarse_voxel_size=args.coarse_voxel_size,
         fine_voxel_size=args.fine_voxel_size,
         use_ground_truth_maps=True,
-        gt_subdir=args.gt_subdir,
+        gt_subdir=args.gt_variant,
         gt_name_suffix=args.gt_name_suffix,
     )
+    # Match diffusion's "first N frames" behavior for quick runs.
+    if args.sequences is not None:
+        train_dataset.base_dataset.sequences = [s.strip() for s in args.sequences]
+    if args.max_scans_per_sequence is not None:
+        # Apply scan window [0, N) on the underlying SemanticKITTI dataset.
+        train_dataset.base_dataset._apply_sequence_scan_window(0, int(args.max_scans_per_sequence))
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
