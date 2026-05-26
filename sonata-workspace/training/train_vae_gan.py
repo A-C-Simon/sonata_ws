@@ -25,11 +25,17 @@ Publication-quality additions (defaults ON):
     better reconstruction quality.
 
 Training schedule:
-    Epochs 0 … disc_warmup_epochs-1  : VAE-only (no adversarial loss)
-    Epochs disc_warmup_epochs … end  : full VAE-GAN
+    Epochs 0 … disc_warmup_epochs-1                          : VAE-only (no adv loss)
+    Epochs disc_warmup_epochs … disc_warmup+ramp_epochs-1    : adv loss linearly
+                                                                ramped 0 → lambda_adv
+    Epochs disc_warmup+ramp_epochs … end                     : full VAE-GAN
 
-This warm-up ensures the VAE has learned a reasonable reconstruction before
-the discriminator starts pushing it, preventing early adversarial collapse.
+The disc-warmup ensures the VAE has learned a reasonable reconstruction
+before the discriminator starts pushing it.  The adversarial ramp avoids
+the step discontinuity at epoch=disc_warmup_epochs that otherwise destabilises
+fine-tunes of an already-converged VAE V3 (the critic dominates and val
+regresses).  Set --lambda_adv_ramp_epochs 0 to disable the ramp (legacy
+step-function behaviour).
 
 Recommended usage:
     # Fine-tune from a pre-trained VAE V3 checkpoint (strongly recommended):
@@ -136,8 +142,12 @@ def parse_args():
                    help="Discriminator update steps per generator step")
     p.add_argument("--lambda_gp", type=float, default=10.0,
                    help="Gradient penalty coefficient (WGAN-GP, default 10)")
-    p.add_argument("--lambda_adv", type=float, default=0.1,
-                   help="Adversarial loss weight in generator loss")
+    p.add_argument("--lambda_adv", type=float, default=0.01,
+                   help="Adversarial loss weight (target) in generator loss. "
+                        "Lowered from 0.1 → 0.01 for safer fine-tunes of a converged V3.")
+    p.add_argument("--lambda_adv_ramp_epochs", type=int, default=5,
+                   help="Linearly ramp lambda_adv from 0 to its target over this many epochs, "
+                        "starting at epoch=disc_warmup_epochs. 0 disables the ramp.")
     p.add_argument("--lambda_fm", type=float, default=10.0,
                    help="Feature-matching loss weight (Salimans 2016). Set to 0 to disable.")
     p.add_argument("--disc_warmup_epochs", type=int, default=10,
@@ -210,6 +220,25 @@ def normalize_points(
     return pts_c / s, centroid, s
 
 
+def lambda_adv_effective(epoch: int, args) -> float:
+    """
+    Effective lambda_adv at a given epoch, applying the linear ramp from 0 to
+    args.lambda_adv over args.lambda_adv_ramp_epochs starting at
+    args.disc_warmup_epochs.
+
+    At epoch == disc_warmup_epochs the ramp emits 1/ramp_epochs of the target
+    (i.e. small but non-zero), reaching the full target at epoch
+    (disc_warmup_epochs + ramp_epochs - 1).  Set ramp_epochs <= 0 to disable
+    the ramp (legacy step-function behaviour).
+    """
+    if epoch < args.disc_warmup_epochs:
+        return 0.0
+    if args.lambda_adv_ramp_epochs <= 0:
+        return args.lambda_adv
+    progress = (epoch - args.disc_warmup_epochs + 1) / args.lambda_adv_ramp_epochs
+    return args.lambda_adv * min(1.0, max(0.0, progress))
+
+
 def sample_to_n(pts: torch.Tensor, n: int) -> torch.Tensor:
     """Random subsample or tile to exactly n points."""
     N = pts.size(0)
@@ -249,6 +278,7 @@ def train_epoch(
 
     use_adv = epoch >= args.disc_warmup_epochs
     use_fm = use_adv and args.lambda_fm > 0
+    lambda_adv_eff = lambda_adv_effective(epoch, args)
     K = args.num_decoded_points
 
     stats = dict(gen=0.0, disc=0.0, chamfer=0.0, kl=0.0, adv=0.0, fm=0.0)
@@ -338,14 +368,14 @@ def train_epoch(
                 fm_loss = feature_matching_loss(real_feats, fake_feats)
                 g_loss = (
                     g_loss
-                    + args.lambda_adv * adv_loss
+                    + lambda_adv_eff * adv_loss
                     + args.lambda_fm * fm_loss
                 )
                 fm_value = fm_loss.item()
                 stats["fm"] += fm_value
             else:
                 adv_loss = -disc(fake_batch_g).mean()       # Wasserstein gen loss
-                g_loss = g_loss + args.lambda_adv * adv_loss
+                g_loss = g_loss + lambda_adv_eff * adv_loss
             stats["adv"] += adv_loss.item()
 
         g_loss.backward()
@@ -372,11 +402,14 @@ def train_epoch(
         if use_adv:
             writer.add_scalar("train/disc_loss", disc_loss_accum / args.n_critic, step)
             writer.add_scalar("train/adv_loss", adv_loss.item(), step)
+            writer.add_scalar("train/lambda_adv_eff", lambda_adv_eff, step)
             if use_fm:
                 writer.add_scalar("train/fm_loss", fm_value, step)
 
     nb = max(n_batches, 1)
-    return {k: v / nb for k, v in stats.items()}
+    out = {k: v / nb for k, v in stats.items()}
+    out["lambda_adv_eff"] = lambda_adv_eff
+    return out
 
 
 @torch.no_grad()
@@ -582,11 +615,15 @@ def main():
         use_adv = epoch >= args.disc_warmup_epochs
         ema_str = f"  val_ema={va_ema:.6f}" if va_ema is not None else ""
         fm_str = f"  fm={s['fm']:.6f}" if s["fm"] > 0 else ""
+        adv_str = (
+            f"  adv={s['adv']:.6f}  λ_adv={s['lambda_adv_eff']:.4f}"
+            if use_adv else ""
+        )
         logger.info(
             f"Epoch {epoch:3d} | "
             f"gen={s['gen']:.6f}  disc={s['disc']:.6f}  "
-            f"cd={s['chamfer']:.6f}  kl={s['kl']:.4f}  "
-            f"adv={s['adv']:.6f}{fm_str}  "
+            f"cd={s['chamfer']:.6f}  kl={s['kl']:.4f}"
+            f"{adv_str}{fm_str}  "
             f"val={va_live:.6f}{ema_str}  "
             f"adv_mode={'ON' if use_adv else 'OFF'}"
         )
