@@ -345,6 +345,9 @@ def parse_args():
                    help="Path to a previous metrics.json (e.g., evaluate_vae_v3) for side-by-side Δ")
     p.add_argument("--device", type=str, default=None,
                    help="'cuda', 'cuda:1', 'cpu' — auto-detects if omitted")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Seed numpy/torch so GT subsampling and z-sampling are reproducible. "
+                        "Required for a fair paired comparison across checkpoints.")
     p.add_argument("--gt_subdir", type=str, default="ground_truth",
                    help="GT subdirectory name inside data_path")
 
@@ -361,6 +364,10 @@ def parse_args():
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    if args.seed is not None:
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
 
     # Device
     if args.device:
