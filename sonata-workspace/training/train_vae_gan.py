@@ -174,6 +174,12 @@ def parse_args():
     # VAE loss
     p.add_argument("--beta_kl", type=float, default=1e-3)
 
+    # Validation / checkpoint selection
+    p.add_argument("--val_stochastic", action="store_true", default=False,
+                   help="Sample z during validation (legacy). Default decodes the posterior "
+                        "mean μ deterministically, which is the correct, noise-free signal for "
+                        "best-checkpoint selection.")
+
     # Data
     p.add_argument("--point_max_complete", type=int, default=8000)
     p.add_argument("--point_max_partial", type=int, default=20000)
@@ -413,7 +419,17 @@ def train_epoch(
 
 
 @torch.no_grad()
-def validate(vae, loader, args, device):
+def validate(vae, loader, args, device, deterministic: bool = True):
+    """
+    Mean validation loss (CD + beta_kl·KL) over the val split.
+
+    deterministic=True decodes the posterior mean μ instead of a sampled z.
+    This is the correct setting for *best-checkpoint selection*: the metric we
+    care about is reconstruction quality, and sampling z injects reparam noise
+    that turns the selection signal into a noisy estimate (and, once the
+    adversarial phase perturbs logvar, biases it). Pass --val_stochastic to
+    restore the legacy sampled behaviour.
+    """
     vae.eval()
     tot = 0.0
     n = 0
@@ -428,7 +444,7 @@ def validate(vae, loader, args, device):
             pts = cc[cb == b]
             pts_n, _, _ = normalize_points(pts, args.center_gt, args.scale_gt)
             mu, logvar = vae.encode(pts_n)
-            z = vae.reparameterize(mu, logvar)
+            z = mu if deterministic else vae.reparameterize(mu, logvar)
             recon = vae.decode(z)
             cd = chamfer_distance(recon, pts_n)
             kl = kl_divergence(mu.unsqueeze(0), logvar.unsqueeze(0))
@@ -599,10 +615,11 @@ def main():
         )
 
         # Validate live and (if available) EMA weights — log both.
-        va_live = validate(vae, val_loader, args, device)
+        deterministic_val = not args.val_stochastic
+        va_live = validate(vae, val_loader, args, device, deterministic=deterministic_val)
         va_ema = None
         if ema is not None and epoch >= args.ema_start_epoch:
-            va_ema = validate(ema.shadow, val_loader, args, device)
+            va_ema = validate(ema.shadow, val_loader, args, device, deterministic=deterministic_val)
             writer.add_scalar("val/loss_ema", va_ema, epoch)
         writer.add_scalar("val/loss", va_live, epoch)
         writer.add_scalar("lr/gen", opt_gen.param_groups[0]["lr"], epoch)
