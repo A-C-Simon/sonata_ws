@@ -69,6 +69,11 @@ from models.discriminator import (
     feature_matching_loss,
     gradient_penalty,
 )
+from models.critic_token import (
+    TokenCritic,
+    feature_matching_loss_tokens,
+    r1_penalty,
+)
 from models.point_cloud_vae import PointCloudVAE, kl_divergence
 from models.refinement_net import chamfer_distance
 from utils.logger import setup_logger
@@ -152,6 +157,28 @@ def parse_args():
                    help="Feature-matching loss weight (Salimans 2016). Set to 0 to disable.")
     p.add_argument("--disc_warmup_epochs", type=int, default=10,
                    help="Epochs of VAE-only training before enabling the discriminator")
+
+    # --- Critic redesign (root-cause fixes; defaults preserve legacy behaviour) ---
+    p.add_argument("--critic", choices=["multiscale", "token"], default="multiscale",
+                   help="multiscale = legacy global-maxpool critic; "
+                        "token = localized cross-attention K-token critic (mirrors V3).")
+    p.add_argument("--critic_tokens", type=int, default=32)
+    p.add_argument("--critic_dim", type=int, default=256)
+    p.add_argument("--critic_layers", type=int, default=2)
+    p.add_argument("--conditional_critic", action="store_true", default=False,
+                   help="Token critic also cross-attends to the partial scan (judges "
+                        "plausibility conditioned on the input scene).")
+    p.add_argument("--adaptive_adv", action="store_true", default=False,
+                   help="VQGAN-style adaptive adversarial weight: lambda_eff = "
+                        "ramp * ||grad_recon|| / (||grad_adv|| + eps) on the last decoder "
+                        "layer, so the critic never overwhelms reconstruction.")
+    p.add_argument("--adaptive_max", type=float, default=1e4,
+                   help="Clamp for the adaptive adversarial weight.")
+    p.add_argument("--gp_mode", choices=["interp", "r1"], default="interp",
+                   help="interp = legacy WGAN-GP index interpolation (meaningless for "
+                        "unordered sets); r1 = R1 penalty on real samples only.")
+    p.add_argument("--log_grad_align", action="store_true", default=False,
+                   help="Log cosine(grad_recon, grad_adv) on the last decoder layer.")
 
     # EMA of generator weights (publication-grade GAN practice)
     p.add_argument("--use_ema", action="store_true", default=True,
@@ -260,15 +287,31 @@ def sample_to_n(pts: torch.Tensor, n: int) -> torch.Tensor:
 def build_norm_batch(cc, cb, bsz, center, scale, n_pts, device):
     """
     Builds per-sample normalised point cloud list and a stacked (B, n_pts, 3)
-    real batch subsampled to n_pts for the discriminator.
+    real batch subsampled to n_pts for the discriminator. Also returns the
+    per-sample (centroid, scale) so conditioning clouds can be put in the same
+    normalised frame.
     """
-    pts_list = []
+    pts_list, norms = [], []
     for b in range(bsz):
         pts = cc[cb == b]
-        pts_n, _, _ = normalize_points(pts, center, scale)
+        pts_n, c, s = normalize_points(pts, center, scale)
         pts_list.append(pts_n)
+        norms.append((c, s))
     real_batch = torch.stack([sample_to_n(p, n_pts) for p in pts_list])
-    return pts_list, real_batch
+    return pts_list, real_batch, norms
+
+
+def build_ctx_batch(pc, pbatch, norms, bsz, n_pts, device):
+    """Normalise each sample's partial scan with the complete cloud's
+    (centroid, scale) and stack to (B, n_pts, 3) for a conditional critic."""
+    ctx_list = []
+    for b in range(bsz):
+        pts = pc[pbatch == b]
+        c, s = norms[b]
+        if pts.size(0) == 0:
+            pts = torch.zeros(1, 3, device=device)
+        ctx_list.append(sample_to_n((pts - c) / s, n_pts))
+    return torch.stack(ctx_list)
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +330,9 @@ def train_epoch(
     lambda_adv_eff = lambda_adv_effective(epoch, args)
     K = args.num_decoded_points
 
-    stats = dict(gen=0.0, disc=0.0, chamfer=0.0, kl=0.0, adv=0.0, fm=0.0)
+    stats = dict(gen=0.0, disc=0.0, chamfer=0.0, kl=0.0, adv=0.0, fm=0.0,
+                 adapt_w=0.0, cos=0.0)
+    cos_n = 0
     n_batches = 0
 
     for i, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch}")):
@@ -299,9 +344,17 @@ def train_epoch(
         cb = batch["complete_batch"]
         bsz = int(cb.max().item()) + 1
 
-        pts_list, real_batch = build_norm_batch(
+        pts_list, real_batch, norms = build_norm_batch(
             cc, cb, bsz, args.center_gt, args.scale_gt, K, device
         )
+        ctx_batch = None
+        if args.conditional_critic:
+            ctx_batch = build_ctx_batch(
+                batch["partial_coord"], batch["partial_batch"], norms, bsz, K, device
+            )
+
+        def disc_fwd(x, **kw):
+            return disc(x, ctx_batch, **kw) if ctx_batch is not None else disc(x, **kw)
 
         # ----------------------------------------------------------------
         # Discriminator steps (n_critic per generator step)
@@ -321,9 +374,12 @@ def train_epoch(
                     fake_batch = torch.stack(fake_list)   # (B, K, 3)
 
                 opt_disc.zero_grad()
-                real_score = disc(real_batch)             # (B, 1)
-                fake_score = disc(fake_batch.detach())    # (B, 1)
-                gp = gradient_penalty(disc, real_batch, fake_batch.detach(), device)
+                real_score = disc_fwd(real_batch)             # (B, 1)
+                fake_score = disc_fwd(fake_batch.detach())    # (B, 1)
+                if args.gp_mode == "r1":
+                    gp = r1_penalty(disc, real_batch, ctx=ctx_batch)
+                else:
+                    gp = gradient_penalty(disc, real_batch, fake_batch.detach(), device)
                 d_loss = (
                     fake_score.mean() - real_score.mean()
                     + args.lambda_gp * gp
@@ -363,26 +419,47 @@ def train_epoch(
         g_loss = chamfer_term + args.beta_kl * kl_term
 
         fm_value = 0.0
+        adapt_w_val = 1.0
+        cos_val = None
         if use_adv:
             fake_batch_g = torch.stack(recon_list)          # (B, K, 3) — with grads
             if use_fm:
                 # Single D forward pass on each side, taking score + features
-                fake_score_g, fake_feats = disc(fake_batch_g, return_features=True)
+                fake_score_g, fake_feats = disc_fwd(fake_batch_g, return_features=True)
                 with torch.no_grad():
-                    _, real_feats = disc(real_batch, return_features=True)
+                    _, real_feats = disc_fwd(real_batch, return_features=True)
                 adv_loss = -fake_score_g.mean()
                 fm_loss = feature_matching_loss(real_feats, fake_feats)
-                g_loss = (
-                    g_loss
-                    + lambda_adv_eff * adv_loss
-                    + args.lambda_fm * fm_loss
-                )
+            else:
+                adv_loss = -disc_fwd(fake_batch_g).mean()   # Wasserstein gen loss
+                fm_loss = None
+
+            # VQGAN-style adaptive adversarial weight: balance the adversarial
+            # gradient against the reconstruction gradient on the last decoder
+            # layer, so the critic can never overwhelm reconstruction.
+            if args.adaptive_adv:
+                last = vae.output_head.weight
+                g_rec = torch.autograd.grad(chamfer_term, last, retain_graph=True)[0]
+                g_adv = torch.autograd.grad(adv_loss, last, retain_graph=True)[0]
+                adapt_w = (g_rec.norm() / (g_adv.norm() + 1e-8)).clamp(0, args.adaptive_max).detach()
+                adapt_w_val = adapt_w.item()
+                if args.log_grad_align:
+                    cos_val = torch.nn.functional.cosine_similarity(
+                        g_rec.flatten(), g_adv.flatten(), dim=0).item()
+            else:
+                adapt_w = 1.0
+
+            w_adv = lambda_adv_eff * adapt_w
+            g_loss = g_loss + w_adv * adv_loss
+            if fm_loss is not None:
+                g_loss = g_loss + args.lambda_fm * fm_loss
                 fm_value = fm_loss.item()
                 stats["fm"] += fm_value
-            else:
-                adv_loss = -disc(fake_batch_g).mean()       # Wasserstein gen loss
-                g_loss = g_loss + lambda_adv_eff * adv_loss
             stats["adv"] += adv_loss.item()
+            stats["adapt_w"] += adapt_w_val
+            if cos_val is not None:
+                stats["cos"] += cos_val
+                cos_n += 1
 
         g_loss.backward()
         if args.gradient_clip > 0:
@@ -409,11 +486,17 @@ def train_epoch(
             writer.add_scalar("train/disc_loss", disc_loss_accum / args.n_critic, step)
             writer.add_scalar("train/adv_loss", adv_loss.item(), step)
             writer.add_scalar("train/lambda_adv_eff", lambda_adv_eff, step)
+            if args.adaptive_adv:
+                writer.add_scalar("train/adaptive_w", adapt_w_val, step)
+                writer.add_scalar("train/w_adv_eff", lambda_adv_eff * adapt_w_val, step)
+            if cos_val is not None:
+                writer.add_scalar("train/cos_recon_adv", cos_val, step)
             if use_fm:
                 writer.add_scalar("train/fm_loss", fm_value, step)
 
     nb = max(n_batches, 1)
     out = {k: v / nb for k, v in stats.items()}
+    out["cos"] = stats["cos"] / max(cos_n, 1) if cos_n else None
     out["lambda_adv_eff"] = lambda_adv_eff
     return out
 
@@ -561,7 +644,18 @@ def main():
         num_dec_blocks=args.num_dec_blocks,
     ).to(device)
 
-    disc = MultiScalePointDiscriminator(in_dim=3).to(device)
+    if args.critic == "token":
+        disc = TokenCritic(
+            in_dim=3, dim=args.critic_dim, num_tokens=args.critic_tokens,
+            num_heads=args.num_heads, num_layers=args.critic_layers,
+            conditional=args.conditional_critic,
+        ).to(device)
+    else:
+        disc = MultiScalePointDiscriminator(in_dim=3).to(device)
+    logger.info(
+        f"Critic: {args.critic}  (adaptive_adv={args.adaptive_adv}, "
+        f"gp_mode={args.gp_mode}, conditional={args.conditional_critic})"
+    )
 
     logger.info(f"VAE parameters:           {sum(p.numel() for p in vae.parameters() if p.requires_grad):,}")
     logger.info(f"Discriminator parameters: {sum(p.numel() for p in disc.parameters() if p.requires_grad):,}")
@@ -632,8 +726,10 @@ def main():
         use_adv = epoch >= args.disc_warmup_epochs
         ema_str = f"  val_ema={va_ema:.6f}" if va_ema is not None else ""
         fm_str = f"  fm={s['fm']:.6f}" if s["fm"] > 0 else ""
+        cos_str = f"  cos(rec,adv)={s['cos']:+.3f}" if s.get("cos") is not None else ""
+        aw_str = f"  adapt_w={s['adapt_w']:.4f}" if s.get("adapt_w", 0) else ""
         adv_str = (
-            f"  adv={s['adv']:.6f}  λ_adv={s['lambda_adv_eff']:.4f}"
+            f"  adv={s['adv']:.6f}  λ_adv={s['lambda_adv_eff']:.4f}{aw_str}{cos_str}"
             if use_adv else ""
         )
         logger.info(
