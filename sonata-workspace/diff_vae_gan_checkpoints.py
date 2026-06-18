@@ -119,8 +119,24 @@ def build_vae(args, device):
 
 
 def load_vae_from_ckpt(path, args, device, prefer_ema=True):
-    """Load a VAE, preferring EMA shadow weights when present (publication-grade)."""
+    """Load a VAE, preferring EMA shadow weights when present (publication-grade).
+
+    Also supports Stage-2 residual checkpoints (refiner_state_dict): builds the
+    frozen base VAE from ckpt['resume_vae'] and wraps it with the ResidualRefiner
+    as a RefinedVAE that presents the same interface.
+    """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    if "refiner_state_dict" in ckpt:
+        from models.residual_refine import ResidualRefiner, RefinedVAE
+        base, _, _ = load_vae_from_ckpt(ckpt["resume_vae"], args, device, prefer_ema=False)
+        for p in base.parameters():
+            p.requires_grad_(False)
+        refiner = ResidualRefiner(dim=args.internal_dim, num_heads=args.num_heads,
+                                  num_blocks=2, max_offset=0.1).to(device)
+        refiner.load_state_dict(ckpt["refiner_state_dict"])
+        refiner.eval()
+        wrapped = RefinedVAE(base, refiner).to(device).eval()
+        return wrapped, "residual", ckpt.get("epoch", "?")
     vae = build_vae(args, device)
     if prefer_ema and "vae_ema_state_dict" in ckpt:
         vae.load_state_dict(ckpt["vae_ema_state_dict"])

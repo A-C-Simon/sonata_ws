@@ -18,7 +18,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from models.point_cloud_vae import DecoderBlock
+from models.point_cloud_vae import DecoderBlock, PointCloudVAE
 
 
 class ResidualRefiner(nn.Module):
@@ -57,3 +57,40 @@ class ResidualRefiner(nn.Module):
             refined = refined.squeeze(0)
             offset = offset.squeeze(0)
         return refined, offset
+
+
+class RefinedVAE(torch.nn.Module):
+    """
+    Eval-time wrapper presenting the PointCloudVAE interface (encode / decode /
+    reparameterize / forward) for a frozen Stage-1 VAE + Stage-2 ResidualRefiner,
+    so the existing evaluation/diff machinery works unchanged.
+    """
+
+    def __init__(self, base_vae, refiner: ResidualRefiner):
+        super().__init__()
+        self.base = base_vae
+        self.refiner = refiner
+        self.num_latent_tokens = base_vae.num_latent_tokens
+        self.token_dim = base_vae.token_dim
+        self.latent_dim = base_vae.latent_dim
+
+    def encode(self, points):
+        return self.base.encode(points)
+
+    @staticmethod
+    def reparameterize(mu, logvar):
+        return PointCloudVAE.reparameterize(mu, logvar)
+
+    def decode(self, z):
+        base = self.base.decode(z)
+        single = z.dim() == 1
+        zt = z.view(self.num_latent_tokens, self.token_dim) if single \
+            else z.view(z.size(0), self.num_latent_tokens, self.token_dim)
+        tokens = self.base.token_up(zt)
+        refined, _ = self.refiner(base, tokens)
+        return refined
+
+    def forward(self, points):
+        mu, logvar = self.encode(points)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar

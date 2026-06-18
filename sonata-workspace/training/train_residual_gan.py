@@ -83,6 +83,10 @@ def parse_args():
     p.add_argument("--adaptive_scale", type=float, default=0.2,
                    help="Sub-unity multiplier on the adaptive ceiling (keep the "
                         "orthogonal adversarial push small relative to recon).")
+    p.add_argument("--eps_drift", type=float, default=0.0,
+                   help="Epsilon-drift penalty eps*E[D(real)^2] on the critic "
+                        "(PGGAN/StyleGAN). Keeps the R1 critic's output scale bounded "
+                        "so adv stays O(1) and the adaptive weight does not collapse.")
 
     # VAE arch (must match the frozen checkpoint)
     p.add_argument("--latent_dim", type=int, default=1024)
@@ -144,7 +148,10 @@ def train_epoch(vae, refiner, disc, opt_g, opt_d, loader, epoch, args, writer, d
                     fake = torch.stack(refined)
                 opt_d.zero_grad()
                 gp = r1_penalty(disc, real_batch, ctx=ctx)
-                d_loss = dfwd(fake.detach()).mean() - dfwd(real_batch).mean() + args.lambda_gp * gp
+                rs = dfwd(real_batch)
+                d_loss = dfwd(fake.detach()).mean() - rs.mean() + args.lambda_gp * gp
+                if args.eps_drift > 0:
+                    d_loss = d_loss + args.eps_drift * rs.pow(2).mean()
                 d_loss.backward(); opt_d.step(); dacc += d_loss.item()
             S["disc"] += dacc / args.n_critic
             disc.requires_grad_(False); refiner.requires_grad_(True)
@@ -164,15 +171,19 @@ def train_epoch(vae, refiner, disc, opt_g, opt_d, loader, epoch, args, writer, d
         if use_adv:
             fake_g = torch.stack(refined)
             adv = -dfwd(fake_g).mean()
+            # Always log alignment cos(g_recon, g_adv) on the refiner head, even
+            # when not adaptive (the adaptive weight collapses for a residual that
+            # starts at the CD optimum, where ||g_recon|| ~ 0; fixed lambda_adv +
+            # the offset penalty are the CD leash instead).
+            last = refiner.head.weight
+            g_rec = torch.autograd.grad(cd, last, retain_graph=True)[0]
+            g_adv = torch.autograd.grad(adv, last, retain_graph=True)[0]
+            cos_val = torch.nn.functional.cosine_similarity(
+                g_rec.flatten(), g_adv.flatten(), dim=0).item()
             if args.adaptive_adv:
-                last = refiner.head.weight
-                g_rec = torch.autograd.grad(cd, last, retain_graph=True)[0]
-                g_adv = torch.autograd.grad(adv, last, retain_graph=True)[0]
                 aw = (g_rec.norm() / (g_adv.norm() + 1e-8)).clamp(0, args.adaptive_max).detach()
                 aw = aw * args.adaptive_scale
                 adapt_w_val = aw.item()
-                cos_val = torch.nn.functional.cosine_similarity(
-                    g_rec.flatten(), g_adv.flatten(), dim=0).item()
             else:
                 aw = 1.0
             g_loss = g_loss + lae * aw * adv
