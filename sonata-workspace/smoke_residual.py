@@ -33,7 +33,7 @@ def args(**ov):
         num_decoded_points=K, disc_warmup_epochs=0, lambda_adv=1.0,
         lambda_adv_ramp_epochs=0, conditional_critic=True, n_critic=2,
         lambda_gp=10.0, adaptive_adv=True, adaptive_max=1e4, adaptive_scale=0.2,
-        gamma_offset=1.0)
+        gamma_offset=1.0, eps_drift=1e-3)
     for k, v in ov.items():
         setattr(a, k, v)
     return a
