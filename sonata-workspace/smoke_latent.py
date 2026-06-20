@@ -29,7 +29,8 @@ def fake_loader(n=3, bsz=3):
 
 args = types.SimpleNamespace(
     num_latent_tokens=NTOK, latent_dim=LATENT, disc_warmup_epochs=0, lambda_adv=1e-2,
-    lambda_adv_ramp_epochs=0, n_critic=2, lambda_gp=10.0, eps_drift=1e-2, gamma_z=1.0)
+    lambda_adv_ramp_epochs=0, n_critic=2, lambda_gp=10.0, eps_drift=1e-2, gamma_z=1.0,
+    lambda_fm=10.0)
 
 vae = PointCloudVAE(latent_dim=LATENT, num_decoded_points=K, num_latent_tokens=NTOK,
                     internal_dim=64, num_heads=4, num_dec_blocks=2).to(device).eval()

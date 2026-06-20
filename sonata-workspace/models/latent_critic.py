@@ -65,11 +65,14 @@ class LatentTokenCritic(nn.Module):
             nn.Linear(dim, 1),
         )
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, return_features: bool = False):
         x = self.embed(tokens) + self.pos[:, : tokens.size(1)]
         for blk in self.blocks:
-            x = blk(x)
-        return self.head(x).squeeze(-1).mean(dim=1, keepdim=True)  # (B, 1)
+            x = blk(x)                                            # (B, L, dim) penultimate feats
+        score = self.head(x).squeeze(-1).mean(dim=1, keepdim=True)  # (B, 1)
+        if return_features:
+            return score, x
+        return score
 
 
 class LatentRefiner(nn.Module):

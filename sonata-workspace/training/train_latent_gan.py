@@ -70,6 +70,11 @@ def parse_args():
     p.add_argument("--n_critic", type=int, default=2)
     p.add_argument("--lambda_gp", type=float, default=10.0)
     p.add_argument("--lambda_adv", type=float, default=1e-2)
+    p.add_argument("--lambda_fm", type=float, default=10.0,
+                   help="Latent feature-matching weight: L1 between the critic's "
+                        "penultimate per-token features of refined vs real tokens "
+                        "(batch-mean per token position). Dense gradient that moves "
+                        "the refiner where the single Wasserstein scalar was too weak.")
     p.add_argument("--lambda_adv_ramp_epochs", type=int, default=3)
     p.add_argument("--disc_warmup_epochs", type=int, default=1)
     p.add_argument("--eps_drift", type=float, default=1e-2)
@@ -100,7 +105,7 @@ def train_epoch(vae, refiner, critic, norm, opt_g, opt_d, loader, epoch, args, w
     use_adv = epoch >= args.disc_warmup_epochs
     lae = lambda_adv_effective(epoch, args)
     L, td = args.num_latent_tokens, args.latent_dim // args.num_latent_tokens
-    S = dict(cd=0.0, dz=0.0, adv=0.0, disc=0.0, cos=0.0)
+    S = dict(cd=0.0, dz=0.0, adv=0.0, fm=0.0, disc=0.0, cos=0.0)
     cos_n = 0; nb = 0
 
     for batch in tqdm(loader, desc=f"Epoch {epoch}"):
@@ -145,14 +150,20 @@ def train_epoch(vae, refiner, critic, norm, opt_g, opt_d, loader, epoch, args, w
 
         cos_val = None
         if use_adv:
-            adv = -critic(ref_tok).mean()
+            fake_score, fake_feats = critic(ref_tok, return_features=True)
+            with torch.no_grad():
+                _, real_feats = critic(mu_n_tok, return_features=True)
+            adv = -fake_score.mean()
+            # batch-mean per-token-position feature matching (dense gradient)
+            fm = (fake_feats.mean(0) - real_feats.mean(0)).abs().mean()
+            ramp = (lae / args.lambda_adv) if args.lambda_adv > 0 else 1.0
             last = refiner.head.weight
             g_rec = torch.autograd.grad(cd, last, retain_graph=True)[0]
-            g_adv = torch.autograd.grad(adv, last, retain_graph=True)[0]
+            g_fm = torch.autograd.grad(fm, last, retain_graph=True)[0]
             cos_val = torch.nn.functional.cosine_similarity(
-                g_rec.flatten(), g_adv.flatten(), dim=0).item()
-            g_loss = g_loss + lae * adv
-            S["adv"] += adv.item(); S["cos"] += cos_val; cos_n += 1
+                g_rec.flatten(), g_fm.flatten(), dim=0).item()
+            g_loss = g_loss + lae * adv + args.lambda_fm * ramp * fm
+            S["adv"] += adv.item(); S["fm"] += fm.item(); S["cos"] += cos_val; cos_n += 1
 
         g_loss.backward()
         torch.nn.utils.clip_grad_norm_(refiner.parameters(), 1.0)
@@ -243,7 +254,7 @@ def main():
         writer.add_scalar("val/cd", va, epoch)
         cos_str = f" cos={s['cos']:+.3f}" if s["cos"] is not None else ""
         logger.info(f"Epoch {epoch:3d} | cd={s['cd']:.6f} dz={s['dz']:.3e} adv={s['adv']:.4f} "
-                    f"lambda={s['lae']:.4f}{cos_str} val_cd={va:.6f} "
+                    f"fm={s['fm']:.4f} lambda={s['lae']:.4f}{cos_str} val_cd={va:.6f} "
                     f"{'ADV' if epoch>=args.disc_warmup_epochs else 'OFF'}")
         ck_out = {"epoch": epoch, "refiner_state_dict": refiner.state_dict(),
                   "critic_state_dict": critic.state_dict(),
