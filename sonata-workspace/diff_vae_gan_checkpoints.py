@@ -132,7 +132,8 @@ def load_vae_from_ckpt(path, args, device, prefer_ema=True):
         for p in base.parameters():
             p.requires_grad_(False)
         refiner = ResidualRefiner(dim=args.internal_dim, num_heads=args.num_heads,
-                                  num_blocks=2, max_offset=0.1).to(device)
+                                  num_blocks=ckpt.get("refiner_blocks", 2),
+                                  max_offset=ckpt.get("max_offset", 0.1)).to(device)
         refiner.load_state_dict(ckpt["refiner_state_dict"])
         refiner.eval()
         wrapped = RefinedVAE(base, refiner).to(device).eval()
