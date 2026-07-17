@@ -332,7 +332,8 @@ def parse_args():
     p.add_argument("--output_dir", type=str, default="evaluation_vae_gan")
     p.add_argument("--sequence", type=str, default="08")
     p.add_argument("--num_samples", type=int, default=50)
-    p.add_argument("--point_max_complete", type=int, default=8000)
+    p.add_argument("--point_max_complete", type=int, default=20000,
+                   help="GT subsample size — 20000 matches RA-L canonical eval protocol")
     p.add_argument("--use_mean", action="store_true", default=False,
                    help="Use mu directly instead of sampling z (deterministic mode)")
     p.add_argument("--n_stochastic", type=int, default=1,
@@ -343,11 +344,13 @@ def parse_args():
                    help="Use live VAE weights instead of EMA (default: prefer EMA when present)")
     p.add_argument("--baseline_json", type=str, default=None,
                    help="Path to a previous metrics.json (e.g., evaluate_vae_v3) for side-by-side Δ")
+    p.add_argument("--baseline_ckpt", type=str, default=None,
+                   help="Path to baseline VAE V3 checkpoint — re-evaluated LIVE under same protocol "
+                        "(preferred over --baseline_json which loads stale numbers).")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Seed for reproducible stochastic VAE sampling.")
     p.add_argument("--device", type=str, default=None,
                    help="'cuda', 'cuda:1', 'cpu' — auto-detects if omitted")
-    p.add_argument("--seed", type=int, default=None,
-                   help="Seed numpy/torch so GT subsampling and z-sampling are reproducible. "
-                        "Required for a fair paired comparison across checkpoints.")
     p.add_argument("--gt_subdir", type=str, default="ground_truth",
                    help="GT subdirectory name inside data_path")
 
@@ -361,13 +364,56 @@ def parse_args():
     return p.parse_args()
 
 
+def _load_vae_weights(vae: PointCloudVAE, ckpt, prefer_ema: bool):
+    """Robust weight loader: try ema → vae → model → raw state_dict (last resort)."""
+    if isinstance(ckpt, dict):
+        if prefer_ema and "vae_ema_state_dict" in ckpt:
+            vae.load_state_dict(ckpt["vae_ema_state_dict"])
+            return "EMA"
+        if "vae_state_dict" in ckpt:
+            vae.load_state_dict(ckpt["vae_state_dict"])
+            return "live"
+        if "model_state_dict" in ckpt:
+            vae.load_state_dict(ckpt["model_state_dict"])
+            return "model_state_dict (V3 standalone format)"
+        # Raw state dict: ALL values must be torch.Tensor (no metadata mixed in).
+        if ckpt and all(isinstance(v, torch.Tensor) for v in ckpt.values()):
+            vae.load_state_dict(ckpt)
+            return "raw state_dict"
+    raise KeyError(
+        f"No recognizable VAE weights in checkpoint. Top-level keys: "
+        f"{list(ckpt.keys())[:8] if isinstance(ckpt, dict) else type(ckpt).__name__}"
+    )
+
+
+def _vae_arch_from_ckpt(ckpt, fallback_args):
+    """Extract architecture kwargs from V3-style checkpoint metadata, falling back to CLI args."""
+    if not isinstance(ckpt, dict):
+        return dict(
+            latent_dim=fallback_args.latent_dim,
+            num_decoded_points=fallback_args.num_decoded_points,
+            num_latent_tokens=fallback_args.num_latent_tokens,
+            internal_dim=fallback_args.internal_dim,
+            num_heads=fallback_args.num_heads,
+            num_dec_blocks=fallback_args.num_dec_blocks,
+        )
+    keys = ("latent_dim", "num_decoded_points", "num_latent_tokens",
+            "internal_dim", "num_heads", "num_dec_blocks")
+    return {k: ckpt.get(k, getattr(fallback_args, k)) for k in keys}
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # ---- Seeding (reproducible stochastic eval) ----
     if args.seed is not None:
-        np.random.seed(args.seed)
+        import random
         torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        np.random.seed(args.seed)
+        random.seed(args.seed)
+        print(f"Seeded with {args.seed}")
 
     # Device
     if args.device:
@@ -391,12 +437,7 @@ def main():
         num_dec_blocks=args.num_dec_blocks,
     ).to(device)
     # Prefer EMA weights (publication-grade evaluation) when present.
-    if not args.no_ema and "vae_ema_state_dict" in ckpt:
-        vae.load_state_dict(ckpt["vae_ema_state_dict"])
-        weight_source = "EMA"
-    else:
-        vae.load_state_dict(ckpt["vae_state_dict"])
-        weight_source = "live"
+    weight_source = _load_vae_weights(vae, ckpt, prefer_ema=not args.no_ema)
     vae.eval()
     vae_params = sum(p.numel() for p in vae.parameters())
     print(f"  VAE parameters: {vae_params:,}   (weights: {weight_source})")
@@ -413,13 +454,34 @@ def main():
         print("  Warning: no disc_state_dict in checkpoint — discriminator scores skipped")
 
     # ---- Load baseline for comparison ----
+    # Two modes: (a) live re-eval of a baseline ckpt (preferred, same protocol),
+    # (b) load a stale metrics.json (only for quick sanity checks).
     baseline = None
-    if args.baseline_json and os.path.exists(args.baseline_json):
+    baseline_vae = None
+    if args.baseline_ckpt:
+        if not os.path.exists(args.baseline_ckpt):
+            raise FileNotFoundError(
+                f"--baseline_ckpt not found: {args.baseline_ckpt}"
+            )
+        print(f"  Baseline (live re-eval): {args.baseline_ckpt}")
+        baseline_ck = torch.load(args.baseline_ckpt, map_location="cpu", weights_only=False)
+        baseline_arch = _vae_arch_from_ckpt(baseline_ck, args)
+        if any(baseline_arch[k] != getattr(args, k) for k in baseline_arch):
+            print(f"    note: baseline architecture from ckpt metadata: {baseline_arch}")
+        baseline_vae = PointCloudVAE(**baseline_arch).to(device)
+        baseline_src = _load_vae_weights(baseline_vae, baseline_ck, prefer_ema=False)
+        baseline_vae.eval()
+        print(f"    baseline weights loaded ({baseline_src})")
+    elif args.baseline_json:
+        if not os.path.exists(args.baseline_json):
+            raise FileNotFoundError(
+                f"--baseline_json not found: {args.baseline_json}"
+            )
         with open(args.baseline_json) as f:
             baseline = json.load(f)
-        print(f"  Baseline: {args.baseline_json}")
-    elif args.baseline_json:
-        print(f"  Warning: baseline_json not found at {args.baseline_json}")
+        print(f"  Baseline (stale json): {args.baseline_json}")
+        print(f"  ⚠  Warning: --baseline_json loads cached numbers from another protocol. "
+              f"Prefer --baseline_ckpt for paper-worthy Δ.")
 
     # ---- Data paths ----
     seq_dir = os.path.join(args.data_path, "sequences", args.sequence)
@@ -435,6 +497,7 @@ def main():
 
     # ---- Evaluation loop ----
     results = []
+    baseline_results = []
     real_disc_scores = []
     fake_disc_scores = []
 
@@ -454,6 +517,14 @@ def main():
         )
         frame_result["frame"] = fid
         results.append(frame_result)
+
+        # Re-evaluate baseline VAE on the SAME frame (same protocol, same subsample)
+        if baseline_vae is not None:
+            b_result, _ = evaluate_frame(
+                baseline_vae, None, lidar_raw, gt_raw, args, device
+            )
+            b_result["frame"] = fid
+            baseline_results.append(b_result)
 
         if frame_result["real_score"] is not None:
             real_disc_scores.append(frame_result["real_score"])
@@ -494,6 +565,12 @@ def main():
 
     # ---- Build and print summary ----
     summary = build_summary(results, args, ckpt)
+    # If we ran a live baseline re-eval, build that summary too and use as ref.
+    if baseline_results:
+        baseline_summary = build_summary(baseline_results, args, ckpt)
+        baseline_summary["model"] = "vae_v3_baseline_live"
+        baseline_summary["checkpoint"] = args.baseline_ckpt
+        baseline = baseline_summary  # for print_summary side-by-side
     print_summary(summary, baseline=baseline)
 
     # ---- Save JSON ----
@@ -501,6 +578,11 @@ def main():
     with open(metrics_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\nMetrics saved  → {metrics_path}")
+    if baseline_results:
+        baseline_path = os.path.join(args.output_dir, "metrics_baseline.json")
+        with open(baseline_path, "w") as f:
+            json.dump(baseline_summary, f, indent=2)
+        print(f"Baseline saved → {baseline_path}")
     print(f"BEV plots      → {args.output_dir}/bev_*.png")
     if real_disc_scores:
         print(f"Critic histogram → {args.output_dir}/critic_score_histogram.png")
