@@ -75,3 +75,6 @@ uncertainty_results_lidar/
 **/evaluation_*/bev_*.png
 **/evaluation_*/critic_score_histogram.png
 *.bak_*
+
+## Exception: archived VAE-GAN training logs are tracked
+!**/vae_gan/train_logs/*.log

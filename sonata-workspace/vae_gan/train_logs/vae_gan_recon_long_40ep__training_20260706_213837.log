@@ -1,0 +1,75 @@
+2026-07-06 21:38:37,285 - training - INFO - Logger initialized. Log file: checkpoints/vae_gan_recon_long_40ep/training_20260706_213837.log
+2026-07-06 21:38:37,285 - training - INFO - Namespace(data_path='/home/anywherevla/Simon_ws/dataset/SemanticKITTI/dataset', batch_size=4, num_workers=4, num_epochs=40, lr_gen=0.0003, weight_decay_gen=0.0001, gradient_clip=1.0, warmup_epochs=10, lr_disc=0.0001, n_critic=5, lambda_gp=10.0, lambda_adv=0.0, lambda_adv_ramp_epochs=5, lambda_fm=0.0, disc_warmup_epochs=999, critic='multiscale', critic_tokens=32, critic_dim=256, critic_layers=2, conditional_critic=False, adaptive_adv=False, adaptive_max=10000.0, gp_mode='interp', log_grad_align=False, use_ema=True, ema_decay=0.999, ema_start_epoch=0, latent_dim=1024, num_decoded_points=8000, num_latent_tokens=32, internal_dim=256, num_heads=4, num_dec_blocks=5, beta_kl=0.001, val_stochastic=False, point_max_complete=8000, point_max_partial=20000, center_gt=True, scale_gt=True, output_dir='checkpoints/vae_gan_recon_long_40ep', log_dir='logs/vae_gan_recon_long_40ep', save_freq=5, resume_vae='checkpoints/point_vae_v3/best_point_vae.pth', resume=None, device='cuda', gt_subdir='ground_truth_v1', gt_name_suffix='', seed=42)
+2026-07-06 21:38:37,285 - training - INFO - Seeded with 42
+2026-07-06 21:38:37,285 - training - INFO - Using device: cuda
+2026-07-06 21:38:37,540 - training - INFO - Critic: multiscale  (adaptive_adv=False, gp_mode=interp, conditional=False)
+2026-07-06 21:38:37,541 - training - INFO - VAE parameters:           7,107,523
+2026-07-06 21:38:37,541 - training - INFO - Discriminator parameters: 372,225
+2026-07-06 21:38:37,989 - training - INFO - Loaded pre-trained VAE V3 from checkpoints/point_vae_v3/best_point_vae.pth
+2026-07-06 21:38:37,992 - training - INFO - EMA tracking enabled (decay=0.999, start_epoch=0)
+2026-07-06 21:50:51,196 - training - INFO - Epoch   0 | gen=0.000444  disc=0.000000  cd=0.000363  kl=0.0811  val=0.000460  val_ema=0.000466  adv_mode=OFF
+2026-07-06 21:50:51,272 - training - INFO -   → saved best checkpoint (val=0.000466)
+2026-07-06 22:03:04,525 - training - INFO - Epoch   1 | gen=0.000380  disc=0.000000  cd=0.000309  kl=0.0711  val=0.000422  val_ema=0.000425  adv_mode=OFF
+2026-07-06 22:03:04,627 - training - INFO -   → saved best checkpoint (val=0.000425)
+2026-07-06 22:15:18,910 - training - INFO - Epoch   2 | gen=0.000360  disc=0.000000  cd=0.000293  kl=0.0672  val=0.000425  val_ema=0.000409  adv_mode=OFF
+2026-07-06 22:15:19,019 - training - INFO -   → saved best checkpoint (val=0.000409)
+2026-07-06 22:27:31,541 - training - INFO - Epoch   3 | gen=0.000353  disc=0.000000  cd=0.000286  kl=0.0669  val=0.000398  val_ema=0.000395  adv_mode=OFF
+2026-07-06 22:27:31,641 - training - INFO -   → saved best checkpoint (val=0.000395)
+2026-07-06 22:39:44,667 - training - INFO - Epoch   4 | gen=0.000350  disc=0.000000  cd=0.000284  kl=0.0665  val=0.000389  val_ema=0.000388  adv_mode=OFF
+2026-07-06 22:39:44,771 - training - INFO -   → saved best checkpoint (val=0.000388)
+2026-07-06 22:51:58,716 - training - INFO - Epoch   5 | gen=0.000348  disc=0.000000  cd=0.000283  kl=0.0655  val=0.000383  val_ema=0.000379  adv_mode=OFF
+2026-07-06 22:51:58,826 - training - INFO -   → saved best checkpoint (val=0.000379)
+2026-07-06 23:04:12,120 - training - INFO - Epoch   6 | gen=0.000347  disc=0.000000  cd=0.000282  kl=0.0648  val=0.000387  val_ema=0.000373  adv_mode=OFF
+2026-07-06 23:04:12,225 - training - INFO -   → saved best checkpoint (val=0.000373)
+2026-07-06 23:16:26,615 - training - INFO - Epoch   7 | gen=0.000349  disc=0.000000  cd=0.000283  kl=0.0652  val=0.000394  val_ema=0.000369  adv_mode=OFF
+2026-07-06 23:16:26,721 - training - INFO -   → saved best checkpoint (val=0.000369)
+2026-07-06 23:28:39,887 - training - INFO - Epoch   8 | gen=0.000350  disc=0.000000  cd=0.000285  kl=0.0650  val=0.000378  val_ema=0.000370  adv_mode=OFF
+2026-07-06 23:40:53,745 - training - INFO - Epoch   9 | gen=0.000351  disc=0.000000  cd=0.000285  kl=0.0660  val=0.000376  val_ema=0.000370  adv_mode=OFF
+2026-07-06 23:53:06,135 - training - INFO - Epoch  10 | gen=0.000349  disc=0.000000  cd=0.000285  kl=0.0644  val=0.000377  val_ema=0.000363  adv_mode=OFF
+2026-07-06 23:53:06,247 - training - INFO -   → saved best checkpoint (val=0.000363)
+2026-07-07 00:05:20,037 - training - INFO - Epoch  11 | gen=0.000349  disc=0.000000  cd=0.000285  kl=0.0643  val=0.000387  val_ema=0.000374  adv_mode=OFF
+2026-07-07 00:17:35,669 - training - INFO - Epoch  12 | gen=0.000349  disc=0.000000  cd=0.000283  kl=0.0653  val=0.000374  val_ema=0.000361  adv_mode=OFF
+2026-07-07 00:17:35,786 - training - INFO -   → saved best checkpoint (val=0.000361)
+2026-07-07 00:29:55,690 - training - INFO - Epoch  13 | gen=0.000347  disc=0.000000  cd=0.000282  kl=0.0649  val=0.000369  val_ema=0.000366  adv_mode=OFF
+2026-07-07 00:42:15,596 - training - INFO - Epoch  14 | gen=0.000342  disc=0.000000  cd=0.000278  kl=0.0635  val=0.000369  val_ema=0.000354  adv_mode=OFF
+2026-07-07 00:42:15,703 - training - INFO -   → saved best checkpoint (val=0.000354)
+2026-07-07 00:54:35,592 - training - INFO - Epoch  15 | gen=0.000340  disc=0.000000  cd=0.000277  kl=0.0636  val=0.000379  val_ema=0.000355  adv_mode=OFF
+2026-07-07 01:06:53,470 - training - INFO - Epoch  16 | gen=0.000338  disc=0.000000  cd=0.000275  kl=0.0633  val=0.000374  val_ema=0.000351  adv_mode=OFF
+2026-07-07 01:06:53,588 - training - INFO -   → saved best checkpoint (val=0.000351)
+2026-07-07 01:19:15,637 - training - INFO - Epoch  17 | gen=0.000336  disc=0.000000  cd=0.000273  kl=0.0633  val=0.000364  val_ema=0.000353  adv_mode=OFF
+2026-07-07 01:31:37,154 - training - INFO - Epoch  18 | gen=0.000334  disc=0.000000  cd=0.000271  kl=0.0629  val=0.000357  val_ema=0.000350  adv_mode=OFF
+2026-07-07 01:31:37,260 - training - INFO -   → saved best checkpoint (val=0.000350)
+2026-07-07 01:43:56,197 - training - INFO - Epoch  19 | gen=0.000334  disc=0.000000  cd=0.000270  kl=0.0640  val=0.000358  val_ema=0.000349  adv_mode=OFF
+2026-07-07 01:43:56,301 - training - INFO -   → saved best checkpoint (val=0.000349)
+2026-07-07 01:56:17,514 - training - INFO - Epoch  20 | gen=0.000330  disc=0.000000  cd=0.000267  kl=0.0629  val=0.000361  val_ema=0.000347  adv_mode=OFF
+2026-07-07 01:56:17,624 - training - INFO -   → saved best checkpoint (val=0.000347)
+2026-07-07 02:08:37,452 - training - INFO - Epoch  21 | gen=0.000327  disc=0.000000  cd=0.000264  kl=0.0626  val=0.000377  val_ema=0.000349  adv_mode=OFF
+2026-07-07 02:20:57,416 - training - INFO - Epoch  22 | gen=0.000326  disc=0.000000  cd=0.000263  kl=0.0628  val=0.000357  val_ema=0.000349  adv_mode=OFF
+2026-07-07 02:33:17,881 - training - INFO - Epoch  23 | gen=0.000324  disc=0.000000  cd=0.000261  kl=0.0628  val=0.000355  val_ema=0.000345  adv_mode=OFF
+2026-07-07 02:33:17,989 - training - INFO -   → saved best checkpoint (val=0.000345)
+2026-07-07 02:45:40,577 - training - INFO - Epoch  24 | gen=0.000323  disc=0.000000  cd=0.000260  kl=0.0629  val=0.000354  val_ema=0.000347  adv_mode=OFF
+2026-07-07 02:58:01,751 - training - INFO - Epoch  25 | gen=0.000320  disc=0.000000  cd=0.000257  kl=0.0626  val=0.000350  val_ema=0.000344  adv_mode=OFF
+2026-07-07 02:58:01,868 - training - INFO -   → saved best checkpoint (val=0.000344)
+2026-07-07 03:10:23,386 - training - INFO - Epoch  26 | gen=0.000318  disc=0.000000  cd=0.000256  kl=0.0621  val=0.000352  val_ema=0.000343  adv_mode=OFF
+2026-07-07 03:10:23,495 - training - INFO -   → saved best checkpoint (val=0.000343)
+2026-07-07 03:22:44,120 - training - INFO - Epoch  27 | gen=0.000315  disc=0.000000  cd=0.000254  kl=0.0617  val=0.000349  val_ema=0.000343  adv_mode=OFF
+2026-07-07 03:35:03,457 - training - INFO - Epoch  28 | gen=0.000314  disc=0.000000  cd=0.000252  kl=0.0619  val=0.000344  val_ema=0.000342  adv_mode=OFF
+2026-07-07 03:35:03,553 - training - INFO -   → saved best checkpoint (val=0.000342)
+2026-07-07 03:47:23,144 - training - INFO - Epoch  29 | gen=0.000313  disc=0.000000  cd=0.000251  kl=0.0622  val=0.000347  val_ema=0.000342  adv_mode=OFF
+2026-07-07 03:59:43,120 - training - INFO - Epoch  30 | gen=0.000311  disc=0.000000  cd=0.000249  kl=0.0619  val=0.000343  val_ema=0.000341  adv_mode=OFF
+2026-07-07 03:59:43,218 - training - INFO -   → saved best checkpoint (val=0.000341)
+2026-07-07 04:12:04,043 - training - INFO - Epoch  31 | gen=0.000309  disc=0.000000  cd=0.000248  kl=0.0618  val=0.000343  val_ema=0.000340  adv_mode=OFF
+2026-07-07 04:12:04,147 - training - INFO -   → saved best checkpoint (val=0.000340)
+2026-07-07 04:24:25,351 - training - INFO - Epoch  32 | gen=0.000308  disc=0.000000  cd=0.000247  kl=0.0617  val=0.000343  val_ema=0.000341  adv_mode=OFF
+2026-07-07 04:36:46,505 - training - INFO - Epoch  33 | gen=0.000307  disc=0.000000  cd=0.000246  kl=0.0615  val=0.000342  val_ema=0.000340  adv_mode=OFF
+2026-07-07 04:36:46,616 - training - INFO -   → saved best checkpoint (val=0.000340)
+2026-07-07 04:49:05,835 - training - INFO - Epoch  34 | gen=0.000306  disc=0.000000  cd=0.000245  kl=0.0615  val=0.000341  val_ema=0.000339  adv_mode=OFF
+2026-07-07 04:49:05,945 - training - INFO -   → saved best checkpoint (val=0.000339)
+2026-07-07 05:01:25,928 - training - INFO - Epoch  35 | gen=0.000305  disc=0.000000  cd=0.000244  kl=0.0616  val=0.000340  val_ema=0.000339  adv_mode=OFF
+2026-07-07 05:01:26,027 - training - INFO -   → saved best checkpoint (val=0.000339)
+2026-07-07 05:13:44,687 - training - INFO - Epoch  36 | gen=0.000305  disc=0.000000  cd=0.000243  kl=0.0617  val=0.000339  val_ema=0.000340  adv_mode=OFF
+2026-07-07 05:26:04,453 - training - INFO - Epoch  37 | gen=0.000304  disc=0.000000  cd=0.000243  kl=0.0616  val=0.000339  val_ema=0.000339  adv_mode=OFF
+2026-07-07 05:38:24,091 - training - INFO - Epoch  38 | gen=0.000304  disc=0.000000  cd=0.000243  kl=0.0613  val=0.000339  val_ema=0.000339  adv_mode=OFF
+2026-07-07 05:38:24,188 - training - INFO -   → saved best checkpoint (val=0.000339)
+2026-07-07 05:50:45,010 - training - INFO - Epoch  39 | gen=0.000304  disc=0.000000  cd=0.000242  kl=0.0614  val=0.000339  val_ema=0.000339  adv_mode=OFF
+2026-07-07 05:50:45,098 - training - INFO - Training complete.

@@ -51,7 +51,8 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TRAIN = os.path.join(HERE, "training", "train_vae_gan.py")
+ROOT = os.path.dirname(HERE)
+TRAIN = os.path.join(HERE, "train_vae_gan.py")
 
 # (name, lambda_adv, lambda_fm)
 CONFIGS = [
@@ -131,7 +132,7 @@ def main():
         print("  " + " ".join(cmd))
         if args.execute:
             print(f"  → running {name} ...")
-            r = subprocess.run(cmd, cwd=HERE)
+            r = subprocess.run(cmd, cwd=ROOT)
             if r.returncode != 0:
                 print(f"  !! {name} exited with code {r.returncode}; continuing.")
 

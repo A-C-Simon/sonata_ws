@@ -15,7 +15,7 @@ echo "GT: v1 (ground_truth_v1)" | tee -a $LOG_DIR/run.log
 nvidia-smi --query-gpu=name,memory.free --format=csv,noheader | tee -a $LOG_DIR/run.log
 echo "" | tee -a $LOG_DIR/run.log
 
-python training/train_vae_gan.py \
+python vae_gan/train_vae_gan.py \
   --resume_vae checkpoints/point_vae_v3/best_point_vae.pth \
   --num_epochs 30 \
   --n_critic 2 \

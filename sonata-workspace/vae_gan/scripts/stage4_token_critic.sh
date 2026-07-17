@@ -10,7 +10,7 @@ echo "[stage4] waiting for main queue to finish..."
 while pgrep -f vae_gan_queue.sh > /dev/null; do sleep 300; done
 echo "[stage4] main queue done, starting token critic at $(date)"
 
-python training/train_vae_gan.py \
+python vae_gan/train_vae_gan.py \
   --resume_vae checkpoints/point_vae_v3/best_point_vae.pth \
   --data_path $HOME/Simon_ws/dataset/SemanticKITTI/dataset \
   --batch_size 4 --seed 42 --gt_subdir ground_truth_v1 --device cuda \

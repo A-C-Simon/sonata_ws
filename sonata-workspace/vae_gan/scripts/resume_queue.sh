@@ -7,12 +7,12 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 cd ~/sonata_ws/sonata-workspace-fixed/sonata-workspace
 
 echo "[resume] 1/2 adv_only_1e-4 restart $(date)"
-python run_vae_gan_ablations.py --only adv_only_1e-4 --execute \
+python vae_gan/run_vae_gan_ablations.py --only adv_only_1e-4 --execute \
   --gt_subdir ground_truth_v1 --device cuda
 echo "[resume] adv_only_1e-4 exit=$? $(date)"
 
 echo "[resume] 2/2 token critic restart $(date)"
-python training/train_vae_gan.py \
+python vae_gan/train_vae_gan.py \
   --resume_vae checkpoints/point_vae_v3/best_point_vae.pth \
   --data_path $HOME/Simon_ws/dataset/SemanticKITTI/dataset \
   --batch_size 4 --seed 42 --gt_subdir ground_truth_v1 --device cuda \

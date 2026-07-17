@@ -20,7 +20,7 @@ import sys
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.semantickitti import SemanticKITTI, collate_fn
 from torch.utils.data import DataLoader

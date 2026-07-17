@@ -61,7 +61,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.discriminator import MultiScalePointDiscriminator
 from models.point_cloud_vae import PointCloudVAE

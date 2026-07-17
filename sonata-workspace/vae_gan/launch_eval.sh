@@ -18,7 +18,7 @@ echo "output: $OUT_DIR"
 echo "protocol: 20k subsample (RA-L canonical), 50 frames, v1 GT"
 echo ''
 
-python evaluate_vae_gan.py \
+python vae_gan/evaluate_vae_gan.py \
   --ckpt "$CKPT" \
   --baseline_ckpt checkpoints/point_vae_v3/best_point_vae.pth \
   --output_dir "$OUT_DIR" \

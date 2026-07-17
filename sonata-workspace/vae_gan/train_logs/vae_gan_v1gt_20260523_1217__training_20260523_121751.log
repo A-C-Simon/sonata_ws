@@ -1,0 +1,8 @@
+2026-05-23 12:17:51,875 - training - INFO - Logger initialized. Log file: /home/anywherevla/sonata_ws/sonata-workspace-fixed/sonata-workspace/checkpoints/vae_gan_v1gt_20260523_1217/training_20260523_121751.log
+2026-05-23 12:17:51,878 - training - INFO - Namespace(data_path='/home/anywherevla/Simon_ws/dataset/SemanticKITTI/dataset', batch_size=16, num_workers=4, num_epochs=30, lr_gen=0.0001, weight_decay_gen=0.0001, gradient_clip=1.0, warmup_epochs=10, lr_disc=0.0001, n_critic=2, lambda_gp=10.0, lambda_adv=0.1, lambda_fm=1.0, disc_warmup_epochs=10, use_ema=True, ema_decay=0.999, ema_start_epoch=10, latent_dim=1024, num_decoded_points=8000, num_latent_tokens=32, internal_dim=256, num_heads=4, num_dec_blocks=5, beta_kl=0.001, point_max_complete=8000, point_max_partial=20000, center_gt=True, scale_gt=True, output_dir='/home/anywherevla/sonata_ws/sonata-workspace-fixed/sonata-workspace/checkpoints/vae_gan_v1gt_20260523_1217', log_dir='/home/anywherevla/sonata_ws/sonata-workspace-fixed/sonata-workspace/logs/vae_gan_20260523_1217', save_freq=5, resume_vae='checkpoints/point_vae_v3/best_point_vae.pth', resume=None, device=None, gt_subdir='ground_truth_v1', gt_name_suffix='', seed=42)
+2026-05-23 12:17:51,888 - training - INFO - Seeded with 42
+2026-05-23 12:17:51,962 - training - INFO - Using device: cuda
+2026-05-23 12:17:52,154 - training - INFO - VAE parameters:           7,107,523
+2026-05-23 12:17:52,154 - training - INFO - Discriminator parameters: 372,225
+2026-05-23 12:17:52,653 - training - INFO - Loaded pre-trained VAE V3 from checkpoints/point_vae_v3/best_point_vae.pth
+2026-05-23 12:17:52,657 - training - INFO - EMA tracking enabled (decay=0.999, start_epoch=10)
