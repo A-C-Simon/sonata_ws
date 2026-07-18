@@ -147,6 +147,12 @@ def parse_args():
                    help="Discriminator update steps per generator step")
     p.add_argument("--lambda_gp", type=float, default=10.0,
                    help="Gradient penalty coefficient (WGAN-GP, default 10)")
+    p.add_argument("--critic_drift", type=float, default=0.0,
+                   help="Weight of the WGAN drift penalty eps*E[D(real)^2] "
+                        "(Karras et al. 2018). Anchors the critic score scale. "
+                        "R1 constrains gradients at real samples but not the "
+                        "score magnitude, so critics whose scores run away "
+                        "need this to stay bounded.")
     p.add_argument("--lambda_adv", type=float, default=0.01,
                    help="Adversarial loss weight (target) in generator loss. "
                         "Lowered from 0.1 → 0.01 for safer fine-tunes of a converged V3.")
@@ -384,6 +390,8 @@ def train_epoch(
                     fake_score.mean() - real_score.mean()
                     + args.lambda_gp * gp
                 )
+                if args.critic_drift > 0:
+                    d_loss = d_loss + args.critic_drift * (real_score ** 2).mean()
                 d_loss.backward()
                 opt_disc.step()
                 disc_loss_accum += d_loss.item()
