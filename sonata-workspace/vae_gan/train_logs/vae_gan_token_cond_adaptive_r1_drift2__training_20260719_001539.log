@@ -1,0 +1,34 @@
+2026-07-19 00:15:39,326 - training - INFO - Logger initialized. Log file: checkpoints/vae_gan_token_cond_adaptive_r1_drift2/training_20260719_001539.log
+2026-07-19 00:15:39,326 - training - INFO - Namespace(data_path='/home/anywherevla/Simon_ws/dataset/SemanticKITTI/dataset', batch_size=4, num_workers=4, num_epochs=25, lr_gen=0.0003, weight_decay_gen=0.0001, gradient_clip=1.0, warmup_epochs=10, lr_disc=1e-05, n_critic=5, lambda_gp=10.0, critic_drift=0.01, lambda_adv=0.01, lambda_adv_ramp_epochs=3, lambda_fm=0.0, disc_warmup_epochs=2, critic='token', critic_tokens=32, critic_dim=256, critic_layers=2, conditional_critic=True, adaptive_adv=True, adaptive_max=10000.0, gp_mode='r1', log_grad_align=True, use_ema=True, ema_decay=0.999, ema_start_epoch=0, latent_dim=1024, num_decoded_points=8000, num_latent_tokens=32, internal_dim=256, num_heads=4, num_dec_blocks=5, beta_kl=0.001, val_stochastic=False, point_max_complete=8000, point_max_partial=20000, center_gt=True, scale_gt=True, output_dir='checkpoints/vae_gan_token_cond_adaptive_r1_drift2', log_dir='logs/vae_gan_token_cond_adaptive_r1_drift2', save_freq=5, resume_vae='checkpoints/point_vae_v3/best_point_vae.pth', resume=None, device='cuda', gt_subdir='ground_truth_v1', gt_name_suffix='', seed=42)
+2026-07-19 00:15:39,327 - training - INFO - Seeded with 42
+2026-07-19 00:15:39,327 - training - INFO - Using device: cuda
+2026-07-19 00:15:39,846 - training - INFO - Critic: token  (adaptive_adv=True, gp_mode=r1, conditional=True)
+2026-07-19 00:15:39,846 - training - INFO - VAE parameters:           7,107,523
+2026-07-19 00:15:39,846 - training - INFO - Discriminator parameters: 3,304,449
+2026-07-19 00:15:40,559 - training - INFO - Loaded pre-trained VAE V3 from checkpoints/point_vae_v3/best_point_vae.pth
+2026-07-19 00:15:40,563 - training - INFO - EMA tracking enabled (decay=0.999, start_epoch=0)
+2026-07-19 00:28:48,179 - training - INFO - Epoch   0 | gen=0.000447  disc=0.000000  cd=0.000365  kl=0.0818  val=0.000461  val_ema=0.000468  adv_mode=OFF
+2026-07-19 00:28:48,324 - training - INFO -   → saved best checkpoint (val=0.000468)
+2026-07-19 00:41:53,278 - training - INFO - Epoch   1 | gen=0.000380  disc=0.000000  cd=0.000309  kl=0.0709  val=0.000427  val_ema=0.000422  adv_mode=OFF
+2026-07-19 00:41:53,571 - training - INFO -   → saved best checkpoint (val=0.000422)
+2026-07-19 01:35:01,321 - training - INFO - Epoch   2 | gen=0.000418  disc=1753.791227  cd=0.000292  kl=0.0677  adv=126.097875  λ_adv=0.0033  adapt_w=0.0002  cos(rec,adv)=-0.006  val=0.000409  val_ema=0.000407  adv_mode=ON
+2026-07-19 01:35:01,701 - training - INFO -   → saved best checkpoint (val=0.000407)
+2026-07-19 02:28:07,009 - training - INFO - Epoch   3 | gen=0.000811  disc=25058.923112  cd=0.000287  kl=0.0664  adv=925.190390  λ_adv=0.0067  adapt_w=0.0001  cos(rec,adv)=-0.006  val=0.000401  val_ema=0.000396  adv_mode=ON
+2026-07-19 02:28:07,372 - training - INFO -   → saved best checkpoint (val=0.000396)
+2026-07-19 03:21:16,260 - training - INFO - Epoch   4 | gen=0.001048  disc=279782.166403  cd=0.000284  kl=0.0658  adv=2413.923528  λ_adv=0.0100  adapt_w=0.0000  cos(rec,adv)=-0.012  val=0.000386  val_ema=0.000382  adv_mode=ON
+2026-07-19 03:21:16,636 - training - INFO -   → saved best checkpoint (val=0.000382)
+2026-07-19 04:14:21,850 - training - INFO - Epoch   5 | gen=0.003353  disc=1677195.296732  cd=0.000283  kl=0.0667  adv=6221.189096  λ_adv=0.0100  adapt_w=0.0000  cos(rec,adv)=-0.002  val=0.000385  val_ema=0.000383  adv_mode=ON
+2026-07-19 05:07:15,615 - training - INFO - Epoch   6 | gen=0.002865  disc=3362429.972025  cd=0.000282  kl=0.0650  adv=8080.422020  λ_adv=0.0100  adapt_w=0.0000  cos(rec,adv)=-0.010  val=0.000428  val_ema=0.000373  adv_mode=ON
+2026-07-19 05:07:15,973 - training - INFO -   → saved best checkpoint (val=0.000373)
+2026-07-19 06:00:17,726 - training - INFO - Epoch   7 | gen=0.001280  disc=2012194.094110  cd=0.000284  kl=0.0653  adv=9691.295226  λ_adv=0.0100  adapt_w=0.0000  cos(rec,adv)=-0.009  val=0.000382  val_ema=0.000372  adv_mode=ON
+2026-07-19 06:00:18,093 - training - INFO -   → saved best checkpoint (val=0.000372)
+2026-07-19 06:53:11,449 - training - INFO - Epoch   8 | gen=0.002192  disc=5160018.450990  cd=0.000285  kl=0.0653  adv=15460.940140  λ_adv=0.0100  adapt_w=0.0000  cos(rec,adv)=-0.012  val=0.000388  val_ema=0.000370  adv_mode=ON
+2026-07-19 06:53:11,820 - training - INFO -   → saved best checkpoint (val=0.000370)
+2026-07-19 07:46:04,002 - training - INFO - Epoch   9 | gen=0.000691  disc=3997574.975293  cd=0.000285  kl=0.0652  adv=8698.407795  λ_adv=0.0100  adapt_w=0.0000  cos(rec,adv)=-0.006  val=0.000386  val_ema=0.000368  adv_mode=ON
+2026-07-19 07:46:04,320 - training - INFO -   → saved best checkpoint (val=0.000368)
+2026-07-19 08:38:57,903 - training - INFO - Epoch  10 | gen=0.000856  disc=9089007.600684  cd=0.000287  kl=0.0648  adv=20293.742108  λ_adv=0.0100  adapt_w=0.0000  cos(rec,adv)=-0.006  val=0.000377  val_ema=0.000361  adv_mode=ON
+2026-07-19 08:38:58,285 - training - INFO -   → saved best checkpoint (val=0.000361)
+2026-07-19 09:31:52,126 - training - INFO - Epoch  11 | gen=0.000554  disc=6905693.168321  cd=0.000284  kl=0.0638  adv=11061.333011  λ_adv=0.0100  adapt_w=0.0000  cos(rec,adv)=-0.011  val=0.000381  val_ema=0.000365  adv_mode=ON
+2026-07-19 10:24:46,428 - training - INFO - Epoch  12 | gen=0.000365  disc=-1616.473446  cd=0.000283  kl=0.0648  adv=15723.120166  λ_adv=0.0100  adapt_w=0.0000  cos(rec,adv)=-0.006  val=0.000375  val_ema=0.000366  adv_mode=ON
+2026-07-19 11:17:40,981 - training - INFO - Epoch  13 | gen=0.000656  disc=12422.243584  cd=0.000279  kl=0.0647  adv=44748.647497  λ_adv=0.0100  adapt_w=0.0000  cos(rec,adv)=-0.001  val=0.000380  val_ema=0.000361  adv_mode=ON
+2026-07-19 11:17:41,356 - training - INFO -   → saved best checkpoint (val=0.000361)

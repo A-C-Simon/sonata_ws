@@ -1,0 +1,13 @@
+2026-07-18 15:15:08,842 - training - INFO - Logger initialized. Log file: checkpoints/vae_gan_token_cond_adaptive_r1_drift/training_20260718_151508.log
+2026-07-18 15:15:08,842 - training - INFO - Namespace(data_path='/home/anywherevla/Simon_ws/dataset/SemanticKITTI/dataset', batch_size=4, num_workers=4, num_epochs=25, lr_gen=0.0003, weight_decay_gen=0.0001, gradient_clip=1.0, warmup_epochs=10, lr_disc=0.0001, n_critic=5, lambda_gp=10.0, critic_drift=0.001, lambda_adv=0.01, lambda_adv_ramp_epochs=3, lambda_fm=0.0, disc_warmup_epochs=2, critic='token', critic_tokens=32, critic_dim=256, critic_layers=2, conditional_critic=True, adaptive_adv=True, adaptive_max=10000.0, gp_mode='r1', log_grad_align=True, use_ema=True, ema_decay=0.999, ema_start_epoch=0, latent_dim=1024, num_decoded_points=8000, num_latent_tokens=32, internal_dim=256, num_heads=4, num_dec_blocks=5, beta_kl=0.001, val_stochastic=False, point_max_complete=8000, point_max_partial=20000, center_gt=True, scale_gt=True, output_dir='checkpoints/vae_gan_token_cond_adaptive_r1_drift', log_dir='logs/vae_gan_token_cond_adaptive_r1_drift', save_freq=5, resume_vae='checkpoints/point_vae_v3/best_point_vae.pth', resume=None, device='cuda', gt_subdir='ground_truth_v1', gt_name_suffix='', seed=42)
+2026-07-18 15:15:08,842 - training - INFO - Seeded with 42
+2026-07-18 15:15:08,843 - training - INFO - Using device: cuda
+2026-07-18 15:15:09,099 - training - INFO - Critic: token  (adaptive_adv=True, gp_mode=r1, conditional=True)
+2026-07-18 15:15:09,100 - training - INFO - VAE parameters:           7,107,523
+2026-07-18 15:15:09,100 - training - INFO - Discriminator parameters: 3,304,449
+2026-07-18 15:15:09,596 - training - INFO - Loaded pre-trained VAE V3 from checkpoints/point_vae_v3/best_point_vae.pth
+2026-07-18 15:15:09,600 - training - INFO - EMA tracking enabled (decay=0.999, start_epoch=0)
+2026-07-18 15:28:03,158 - training - INFO - Epoch   0 | gen=0.000447  disc=0.000000  cd=0.000365  kl=0.0818  val=0.000461  val_ema=0.000468  adv_mode=OFF
+2026-07-18 15:28:03,243 - training - INFO -   → saved best checkpoint (val=0.000468)
+2026-07-18 15:41:36,291 - training - INFO - Epoch   1 | gen=0.000380  disc=0.000000  cd=0.000309  kl=0.0709  val=0.000427  val_ema=0.000422  adv_mode=OFF
+2026-07-18 15:41:36,410 - training - INFO -   → saved best checkpoint (val=0.000422)
