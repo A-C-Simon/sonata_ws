@@ -171,6 +171,12 @@ def parse_args():
     p.add_argument("--critic_tokens", type=int, default=32)
     p.add_argument("--critic_dim", type=int, default=256)
     p.add_argument("--critic_layers", type=int, default=2)
+    p.add_argument("--critic_sn", action="store_true", default=False,
+                   help="Spectral-normalize every linear map in the token "
+                        "critic (including attention projections). Bounds the "
+                        "Wasserstein score scale architecturally; the July "
+                        "2026 runs showed drift and lr alone cannot contain "
+                        "the token critic's score explosion.")
     p.add_argument("--conditional_critic", action="store_true", default=False,
                    help="Token critic also cross-attends to the partial scan (judges "
                         "plausibility conditioned on the input scene).")
@@ -657,6 +663,7 @@ def main():
             in_dim=3, dim=args.critic_dim, num_tokens=args.critic_tokens,
             num_heads=args.num_heads, num_layers=args.critic_layers,
             conditional=args.conditional_critic,
+            spectral_norm=args.critic_sn,
         ).to(device)
     else:
         disc = MultiScalePointDiscriminator(in_dim=3).to(device)

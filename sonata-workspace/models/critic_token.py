@@ -69,6 +69,7 @@ class TokenCritic(nn.Module):
         num_heads: int = 4,
         num_layers: int = 2,
         conditional: bool = False,
+        spectral_norm: bool = False,
     ):
         super().__init__()
         self.conditional = conditional
@@ -92,6 +93,27 @@ class TokenCritic(nn.Module):
             nn.Linear(dim, dim), nn.LeakyReLU(0.2, inplace=True),
             nn.Linear(dim, 1),
         )
+
+        if spectral_norm:
+            self._apply_spectral_norm()
+
+    def _apply_spectral_norm(self) -> None:
+        """Spectral-normalize every linear map, including attention projections.
+
+        Without this the critic's Wasserstein scores grow unbounded under
+        R1: R1 constrains gradients at real samples but not the score
+        scale, and neither a drift penalty (1e-2) nor a 10x lower critic
+        lr stops the blow-up (see train_logs of the four July 2026 token
+        critic runs). Spectral norm makes each linear map 1-Lipschitz so
+        the score scale is architecturally bounded.
+        """
+        from torch.nn.utils import spectral_norm as _sn
+        for m in list(self.modules()):
+            if isinstance(m, nn.MultiheadAttention):
+                if getattr(m, "in_proj_weight", None) is not None:
+                    _sn(m, name="in_proj_weight")
+            elif isinstance(m, nn.Linear):
+                _sn(m, name="weight")
 
     def forward(
         self,
