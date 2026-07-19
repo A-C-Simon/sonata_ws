@@ -107,7 +107,11 @@ class TokenCritic(nn.Module):
         critic runs). Spectral norm makes each linear map 1-Lipschitz so
         the score scale is architecturally bounded.
         """
-        from torch.nn.utils import spectral_norm as _sn
+        # The parametrization API (not the legacy hook-based one) is required
+        # here: nn.MultiheadAttention reads out_proj.weight as a raw attribute
+        # inside its fused forward, so a legacy pre-forward hook never fires
+        # and the weight would stay a stale CPU tensor after .to(device).
+        from torch.nn.utils.parametrizations import spectral_norm as _sn
         for m in list(self.modules()):
             if isinstance(m, nn.MultiheadAttention):
                 if getattr(m, "in_proj_weight", None) is not None:
