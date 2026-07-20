@@ -48,6 +48,7 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.discriminator import MultiScalePointDiscriminator
+from models.critic_token import TokenCritic
 from models.point_cloud_vae import PointCloudVAE
 from models.refinement_net import chamfer_distance
 from evaluation.metrics import compute_all_metrics
@@ -128,7 +129,7 @@ def disc_score_plot(real_scores: list, fake_scores: list, save_path: str):
 @torch.no_grad()
 def evaluate_frame(
     vae: PointCloudVAE,
-    disc: MultiScalePointDiscriminator | None,
+    disc: MultiScalePointDiscriminator | TokenCritic | None,
     lidar_raw: np.ndarray,
     gt_raw: np.ndarray,
     args,
@@ -340,6 +341,15 @@ def parse_args():
                    help="Re-decode N times per frame to measure output variance (>1 enables)")
     p.add_argument("--no_disc", action="store_true", default=False,
                    help="Skip loading the discriminator (faster if critic scores not needed)")
+    p.add_argument("--critic", choices=["multiscale", "token"], default="multiscale",
+                   help="Critic architecture that produced --ckpt's disc_state_dict. Must "
+                        "match the training run or the state dict will not load.")
+    p.add_argument("--critic_tokens", type=int, default=32)
+    p.add_argument("--critic_dim", type=int, default=256)
+    p.add_argument("--critic_layers", type=int, default=2)
+    p.add_argument("--conditional_critic", action="store_true", default=False)
+    p.add_argument("--critic_sn", action="store_true", default=False,
+                   help="Must match --critic_sn used at training time (changes param names).")
     p.add_argument("--no_ema", action="store_true", default=False,
                    help="Use live VAE weights instead of EMA (default: prefer EMA when present)")
     p.add_argument("--baseline_json", type=str, default=None,
@@ -445,7 +455,14 @@ def main():
     # ---- Build discriminator ----
     disc = None
     if not args.no_disc and "disc_state_dict" in ckpt:
-        disc = MultiScalePointDiscriminator(in_dim=3).to(device)
+        if args.critic == "token":
+            disc = TokenCritic(
+                in_dim=3, dim=args.critic_dim, num_tokens=args.critic_tokens,
+                num_heads=args.num_heads, num_layers=args.critic_layers,
+                conditional=args.conditional_critic, spectral_norm=args.critic_sn,
+            ).to(device)
+        else:
+            disc = MultiScalePointDiscriminator(in_dim=3).to(device)
         disc.load_state_dict(ckpt["disc_state_dict"])
         disc.eval()
         disc_params = sum(p.numel() for p in disc.parameters())
